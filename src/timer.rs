@@ -1,8 +1,9 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 static TICK_INTERVAL: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
+static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn read_cntfrq() -> u64 {
@@ -48,9 +49,27 @@ pub fn init() {
     write_cntp_ctl(1);
 }
 
+pub fn set_trace(enabled: bool) {
+    TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_trace_enabled() -> bool {
+    TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+pub fn frequency_hz() -> u64 {
+    read_cntfrq()
+}
+
 pub fn handle_tick() {
     let interval = TICK_INTERVAL.load(Ordering::Relaxed);
     write_cntp_tval(interval);
     let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    crate::kprintln!("[timer] tick #{}", tick);
+    if TRACE_ENABLED.load(Ordering::Relaxed) {
+        crate::kprintln!("[timer] tick #{}", tick);
+    }
 }
