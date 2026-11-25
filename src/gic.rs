@@ -5,7 +5,9 @@ const GICC_BASE: usize = 0x0801_0000;
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER0: usize = 0x100;
+const GICD_ISENABLER1: usize = 0x104;
 const GICD_IPRIORITYR: usize = 0x400;
+const GICD_ITARGETSR: usize = 0x800;
 
 const GICC_CTLR: usize = 0x000;
 const GICC_PMR: usize = 0x004;
@@ -14,6 +16,8 @@ const GICC_EOIR: usize = 0x010;
 
 /// Non-secure EL1 physical timer interrupt ID (PPI 14 -> IRQ 30).
 pub const TIMER_IRQ_ID: u32 = 30;
+/// PL011 UART0 interrupt ID (SPI 1 -> IRQ 33).
+pub const UART0_IRQ_ID: u32 = 33;
 
 #[inline]
 fn write_gicd(offset: usize, value: u32) {
@@ -23,7 +27,7 @@ fn write_gicd(offset: usize, value: u32) {
 
 #[inline]
 fn write_gicd_byte(offset: usize, value: u8) {
-    // SAFETY: `GICD_BASE + offset` addresses a byte-accessible GICv2 Distributor priority register on QEMU virt.
+    // SAFETY: `GICD_BASE + offset` addresses a byte-accessible GICv2 Distributor MMIO register on QEMU virt.
     unsafe { write_volatile((GICD_BASE + offset) as *mut u8, value) }
 }
 
@@ -45,9 +49,13 @@ pub fn init() {
 
     // Enable IRQ 30 (Non-secure EL1 physical timer) in GICD_ISENABLER0.
     write_gicd(GICD_ISENABLER0, 1 << TIMER_IRQ_ID);
-
-    // Set highest priority (0x00) for IRQ 30 via byte write to GICD_IPRIORITYR.
+    // Set highest priority (0x00) for IRQ 30 in GICD_IPRIORITYR.
     write_gicd_byte(GICD_IPRIORITYR + (TIMER_IRQ_ID as usize), 0x00);
+
+    // Enable IRQ 33 (UART0 SPI 1, bit 1) in GICD_ISENABLER1, priority 0x00, routed to CPU 0 (0x01).
+    write_gicd(GICD_ISENABLER1, 1 << (UART0_IRQ_ID - 32));
+    write_gicd_byte(GICD_IPRIORITYR + (UART0_IRQ_ID as usize), 0x00);
+    write_gicd_byte(GICD_ITARGETSR + (UART0_IRQ_ID as usize), 0x01);
 
     // Re-enable Distributor.
     write_gicd(GICD_CTLR, 1);
