@@ -4,9 +4,13 @@
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
+mod exceptions;
+mod gic;
+mod timer;
 mod uart;
 
 global_asm!(include_str!("boot.S"));
+core::arch::global_asm!(include_str!("exceptions.S"));
 
 fn current_el() -> u64 {
     let el: u64;
@@ -25,6 +29,19 @@ pub extern "C" fn kmain() -> ! {
     assert_eq!(el, 1, "expected kernel to run at EL1");
 
     kprintln!("Aegis Kernel v0.1.0 booted on AArch64 (EL{})", el);
+
+    exceptions::init();
+    gic::init();
+    timer::init();
+    exceptions::enable_irqs();
+
+    // SAFETY: `brk #0` triggers a synchronous EL1 debug trap handled by `handle_sync_exception`,
+    // which logs the trap and advances `ELR_EL1` past the 4-byte instruction.
+    unsafe {
+        core::arch::asm!("brk #0");
+    }
+
+    kprintln!("Aegis interrupts & 1Hz timer active");
 
     loop {
         // SAFETY: `wfe` places the core in a low-power wait state until an event occurs.
