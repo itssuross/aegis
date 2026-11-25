@@ -16,7 +16,7 @@ unsafe extern "C" {
 #[inline]
 fn read_current_el() -> u64 {
     let el: u64;
-    // SAFETY: Reading `CurrentEL` is valid at EL1 on AArch64 with no side effects.
+    // SAFETY: `CurrentEL` is readable at EL1.
     unsafe {
         asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack, preserves_flags));
     }
@@ -26,7 +26,7 @@ fn read_current_el() -> u64 {
 #[inline]
 fn read_midr_el1() -> u64 {
     let midr: u64;
-    // SAFETY: Reading `MIDR_EL1` is valid at EL1 on AArch64 with no side effects.
+    // SAFETY: `MIDR_EL1` is readable at EL1.
     unsafe {
         asm!("mrs {}, midr_el1", out(reg) midr, options(nomem, nostack, preserves_flags));
     }
@@ -34,7 +34,7 @@ fn read_midr_el1() -> u64 {
 }
 
 fn psci_call(function_id: u64) -> ! {
-    // SAFETY: Invokes QEMU virt's PSCI HVC conduit (`SYSTEM_RESET` or `SYSTEM_OFF`).
+    // SAFETY: Callers pass a PSCI system function ID supported by QEMU's HVC conduit.
     unsafe {
         asm!(
             "hvc #0",
@@ -46,7 +46,6 @@ fn psci_call(function_id: u64) -> ! {
         );
     }
     loop {
-        // SAFETY: `wfe` halts the core if the PSCI call unexpectedly returns.
         unsafe {
             asm!("wfe", options(nomem, nostack, preserves_flags));
         }
@@ -141,13 +140,13 @@ fn execute(line: &str) {
             _ => kprintln!("usage: trace <on|off>"),
         },
         "brk" => {
-            // SAFETY: `brk #0` triggers an EL1 debug trap handled by `handle_sync_exception`,
-            // which logs the trap and advances `ELR_EL1` past the 4-byte instruction.
+            // SAFETY: The EL1 breakpoint handler advances `ELR_EL1` past `brk #0`.
             unsafe {
                 core::arch::asm!("brk #0");
             }
         }
         "clear" => {
+            // ANSI clear screen and move cursor home.
             kprint!("\x1b[2J\x1b[H");
         }
         "reboot" => {
@@ -173,10 +172,11 @@ pub extern "C" fn shell_main() -> ! {
 
     loop {
         let Some(byte) = crate::uart::try_read_byte() else {
-            // SAFETY: `wfe` places the core in a low-power wait state until an event arrives.
+            // SAFETY: `wfe` can suspend this core until an event or IRQ arrives.
             unsafe {
                 asm!("wfe", options(nomem, nostack, preserves_flags));
             }
+            crate::scheduler::yield_now();
             continue;
         };
 
@@ -195,6 +195,7 @@ pub extern "C" fn shell_main() -> ! {
                 len = 0;
                 kprint!("aegis> ");
             }
+            // ASCII backspace and delete.
             0x08 | 0x7F => {
                 last_cr = false;
                 if len > 0 {
