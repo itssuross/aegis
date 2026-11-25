@@ -136,11 +136,13 @@ extern "C" fn worker_beta() -> ! {
 
 fn idle() -> ! {
     loop {
-        // SAFETY: `wfe` can suspend this core until an event or IRQ arrives.
-        unsafe {
-            asm!("wfe", options(nomem, nostack, preserves_flags));
+        if !crate::uart::has_pending_input() {
+            // SAFETY: `wfe` can suspend this core until an event or IRQ arrives.
+            unsafe {
+                asm!("wfe", options(nomem, nostack, preserves_flags));
+            }
         }
-        scheduler::yield_now();
+        crate::scheduler::yield_now();
     }
 }
 
