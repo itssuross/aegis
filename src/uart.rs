@@ -116,6 +116,11 @@ pub fn try_read_byte() -> Option<u8> {
     RX_RING.pop()
 }
 
+#[allow(dead_code, reason = "the idle loops wire up this API in a separate commit")]
+pub fn has_pending_input() -> bool {
+    RX_RING.head.load(Ordering::Acquire) != RX_RING.tail.load(Ordering::Acquire)
+}
+
 fn put_raw_byte(byte: u8) {
     while (read_reg(FR) & FR_TXFF) != 0 {
         core::hint::spin_loop();
