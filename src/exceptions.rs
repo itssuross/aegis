@@ -148,6 +148,10 @@ extern "C" fn handle_irq_exception(_frame: &mut TrapFrame) {
             crate::gic::end_of_interrupt(iar);
             crate::scheduler::on_timer_tick();
         }
+        crate::gic::UART0_IRQ_ID => {
+            crate::uart::handle_irq();
+            crate::gic::end_of_interrupt(iar);
+        }
         0..=1019 => crate::gic::end_of_interrupt(iar),
         _ => {}
     }
