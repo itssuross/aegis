@@ -11,6 +11,7 @@ mod exceptions;
 mod gic;
 mod mmu;
 mod scheduler;
+mod shell;
 mod timer;
 mod uart;
 
@@ -111,6 +112,7 @@ pub extern "C" fn kmain() -> ! {
     scheduler::init();
     scheduler::spawn("worker-alpha", worker_alpha);
     scheduler::spawn("worker-beta", worker_beta);
+    scheduler::spawn("shell", shell::shell_main);
 
     gic::init();
     timer::init();
