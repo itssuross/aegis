@@ -10,11 +10,13 @@ mod allocator;
 mod exceptions;
 mod gic;
 mod mmu;
+mod scheduler;
 mod timer;
 mod uart;
 
 global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
+core::arch::global_asm!(include_str!("context.S"));
 
 unsafe extern "C" {
     static __heap_start: u8;
@@ -49,10 +51,6 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         allocator::init(heap_start, heap_end - heap_start);
     }
-
-    gic::init();
-    timer::init();
-    exceptions::enable_irqs();
 
     // SAFETY: `brk #0` triggers a synchronous EL1 debug trap handled by `handle_sync_exception`,
     // which logs the trap and advances `ELR_EL1` past the 4-byte instruction.
@@ -110,8 +108,32 @@ pub extern "C" fn kmain() -> ! {
         free
     );
 
-    kprintln!("Aegis interrupts & 1Hz timer active");
+    scheduler::init();
+    scheduler::spawn("worker-alpha", worker_alpha);
+    scheduler::spawn("worker-beta", worker_beta);
 
+    gic::init();
+    timer::init();
+    exceptions::enable_irqs();
+    kprintln!("Aegis interrupts & 1Hz timer active");
+    idle();
+}
+
+extern "C" fn worker_alpha() -> ! {
+    for step in 1..=3 {
+        kprintln!("[thread:alpha] step {}", step);
+    }
+    idle();
+}
+
+extern "C" fn worker_beta() -> ! {
+    for step in 1..=3 {
+        kprintln!("[thread:beta] step {}", step);
+    }
+    idle();
+}
+
+fn idle() -> ! {
     loop {
         // SAFETY: `wfe` places the core in a low-power wait state until an event occurs.
         unsafe {
