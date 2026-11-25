@@ -26,7 +26,7 @@ unsafe extern "C" {
 
 fn current_el() -> u64 {
     let el: u64;
-    // SAFETY: Reading `CurrentEL` is valid at EL1 and above on AArch64 with no side effects.
+    // SAFETY: `CurrentEL` is readable at EL1.
     unsafe {
         asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack, preserves_flags));
     }
@@ -47,14 +47,13 @@ pub extern "C" fn kmain() -> ! {
 
     let heap_start = &raw const __heap_start as usize;
     let heap_end = &raw const __heap_end as usize;
-    // SAFETY: `__heap_start..__heap_end` is a linker-reserved, page-aligned region past the end
-    // of the kernel image that nothing else uses, and no allocation has happened yet.
+    // SAFETY: The linker reserves this page-aligned region exclusively for the heap.
+    // No allocations have occurred yet.
     unsafe {
         allocator::init(heap_start, heap_end - heap_start);
     }
 
-    // SAFETY: `brk #0` triggers a synchronous EL1 debug trap handled by `handle_sync_exception`,
-    // which logs the trap and advances `ELR_EL1` past the 4-byte instruction.
+    // SAFETY: The EL1 breakpoint handler advances `ELR_EL1` past `brk #0`.
     unsafe {
         core::arch::asm!("brk #0");
     }
@@ -137,10 +136,11 @@ extern "C" fn worker_beta() -> ! {
 
 fn idle() -> ! {
     loop {
-        // SAFETY: `wfe` places the core in a low-power wait state until an event occurs.
+        // SAFETY: `wfe` can suspend this core until an event or IRQ arrives.
         unsafe {
             asm!("wfe", options(nomem, nostack, preserves_flags));
         }
+        scheduler::yield_now();
     }
 }
 
@@ -158,7 +158,6 @@ fn panic(info: &PanicInfo) -> ! {
     }
 
     loop {
-        // SAFETY: `wfe` halts the core in a low-power wait loop after a fatal panic.
         unsafe {
             asm!("wfe", options(nomem, nostack, preserves_flags));
         }
