@@ -39,6 +39,13 @@ SECTIONS
     . = ALIGN(4096);
     __kernel_end = .;
 
+    /* 16 MiB page-aligned kernel heap */
+    . = ALIGN(4096);
+    __heap_start = .;
+    . += 16 * 1024 * 1024;
+    . = ALIGN(4096);
+    __heap_end = .;
+
     /DISCARD/ : {
         *(.comment)
         *(.note*)
