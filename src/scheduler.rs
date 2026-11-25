@@ -33,11 +33,28 @@ unsafe extern "C" {
     fn thread_entry_trampoline();
 }
 
+#[derive(Clone, Copy)]
+pub struct ThreadInfo {
+    pub id: usize,
+    pub name: &'static str,
+    pub state: &'static str,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ThreadState {
     Ready,
     Running,
     Finished,
+}
+
+impl ThreadState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "READY",
+            Self::Running => "RUNNING",
+            Self::Finished => "FINISHED",
+        }
+    }
 }
 
 struct Thread {
@@ -69,6 +86,8 @@ static SCHEDULER: SchedulerLock = SchedulerLock {
         current: 0,
     }),
 };
+
+static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 struct IrqMask(u64);
 
@@ -179,6 +198,33 @@ pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
     id
 }
 
+pub fn set_trace(enabled: bool) {
+    TRACE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn is_trace_enabled() -> bool {
+    TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn snapshot() -> [Option<ThreadInfo>; MAX_THREADS] {
+    let mut out = [None; MAX_THREADS];
+    let irq_mask = IrqMask::acquire();
+    let mut guard = SCHEDULER.lock(&irq_mask);
+    let scheduler = guard.data();
+    for (dst, src) in out.iter_mut().zip(scheduler.threads.iter()) {
+        if let Some(thread) = src {
+            *dst = Some(ThreadInfo {
+                id: thread.id,
+                name: thread.name,
+                state: thread.state.as_str(),
+            });
+        }
+    }
+    drop(guard);
+    drop(irq_mask);
+    out
+}
+
 pub fn yield_now() {
     schedule(ThreadState::Ready);
 }
@@ -219,13 +265,15 @@ fn schedule(previous_state: ThreadState) {
     let next = next.as_mut().expect("no next thread");
     prev.state = previous_state;
     next.state = ThreadState::Running;
-    crate::kprintln!(
-        "[sched] switching tid {} ({}) -> tid {} ({})",
-        prev.id,
-        prev.name,
-        next.id,
-        next.name
-    );
+    if TRACE_ENABLED.load(Ordering::Relaxed) {
+        crate::kprintln!(
+            "[sched] switching tid {} ({}) -> tid {} ({})",
+            prev.id,
+            prev.name,
+            next.id,
+            next.name
+        );
+    }
     let prev_ptr = &raw mut prev.context;
     let next_ptr = &raw const next.context;
     drop(guard);
