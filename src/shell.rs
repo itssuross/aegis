@@ -1,0 +1,218 @@
+use core::arch::asm;
+
+use crate::{kprint, kprintln};
+
+const LINE_BUF_LEN: usize = 128;
+
+// ARM PSCI 0.2 function IDs (HVC conduit on QEMU virt).
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+
+unsafe extern "C" {
+    static __heap_start: u8;
+    static __heap_end: u8;
+}
+
+#[inline]
+fn read_current_el() -> u64 {
+    let el: u64;
+    // SAFETY: Reading `CurrentEL` is valid at EL1 on AArch64 with no side effects.
+    unsafe {
+        asm!("mrs {}, CurrentEL", out(reg) el, options(nomem, nostack, preserves_flags));
+    }
+    (el >> 2) & 0b11
+}
+
+#[inline]
+fn read_midr_el1() -> u64 {
+    let midr: u64;
+    // SAFETY: Reading `MIDR_EL1` is valid at EL1 on AArch64 with no side effects.
+    unsafe {
+        asm!("mrs {}, midr_el1", out(reg) midr, options(nomem, nostack, preserves_flags));
+    }
+    midr
+}
+
+fn psci_call(function_id: u64) -> ! {
+    // SAFETY: Invokes QEMU virt's PSCI HVC conduit (`SYSTEM_RESET` or `SYSTEM_OFF`).
+    unsafe {
+        asm!(
+            "hvc #0",
+            inout("x0") function_id => _,
+            lateout("x1") _,
+            lateout("x2") _,
+            lateout("x3") _,
+            options(nomem, nostack),
+        );
+    }
+    loop {
+        // SAFETY: `wfe` halts the core if the PSCI call unexpectedly returns.
+        unsafe {
+            asm!("wfe", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+fn execute(line: &str) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let mut parts = trimmed.split_whitespace();
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next();
+    let extra = parts.next();
+
+    match cmd {
+        "help" => {
+            kprintln!("Available commands:");
+            kprintln!("  help            Show this command list");
+            kprintln!("  info            Show kernel version, EL, MIDR_EL1, MMU, and timer freq");
+            kprintln!("  uptime          Show uptime in seconds");
+            kprintln!("  mem             Show heap bounds and allocated/free bytes");
+            kprintln!("  ps              List active kernel threads");
+            kprintln!("  trace <on|off>  Toggle live timer and scheduler trace logging");
+            kprintln!("  brk             Trigger a live BRK #0 synchronous trap");
+            kprintln!("  clear           Clear the serial terminal");
+            kprintln!("  reboot          Reboot via ARM PSCI SYSTEM_RESET");
+            kprintln!("  halt            Power off via ARM PSCI SYSTEM_OFF");
+        }
+        "info" => {
+            let mmu_status = if crate::mmu::is_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            kprintln!("Aegis v0.1.0 (aarch64-unknown-none)");
+            kprintln!("  CurrentEL  : EL{}", read_current_el());
+            kprintln!("  MIDR_EL1   : {:#010x}", read_midr_el1());
+            kprintln!("  MMU        : {}", mmu_status);
+            kprintln!("  CNTFRQ_EL0 : {} Hz", crate::timer::frequency_hz());
+        }
+        "uptime" => {
+            kprintln!("uptime: {}s", crate::timer::ticks());
+        }
+        "mem" => {
+            let heap_start = &raw const __heap_start as usize;
+            let heap_end = &raw const __heap_end as usize;
+            let (allocated, free) = crate::allocator::stats();
+            kprintln!(
+                "heap: {:#x}..{:#x} ({} bytes)",
+                heap_start,
+                heap_end,
+                heap_end - heap_start
+            );
+            kprintln!("  allocated : {} bytes", allocated);
+            kprintln!("  free      : {} bytes", free);
+        }
+        "ps" => {
+            kprintln!("{:<4} {:<9} {}", "TID", "STATE", "NAME");
+            for info in crate::scheduler::snapshot().into_iter().flatten() {
+                kprintln!("{:<4} {:<9} {}", info.id, info.state, info.name);
+            }
+        }
+        "trace" => match (arg, extra) {
+            (Some("on"), None) => {
+                crate::timer::set_trace(true);
+                crate::scheduler::set_trace(true);
+                kprintln!(
+                    "trace: timer={} sched={}",
+                    crate::timer::is_trace_enabled(),
+                    crate::scheduler::is_trace_enabled()
+                );
+            }
+            (Some("off"), None) => {
+                crate::timer::set_trace(false);
+                crate::scheduler::set_trace(false);
+                kprintln!(
+                    "trace: timer={} sched={}",
+                    crate::timer::is_trace_enabled(),
+                    crate::scheduler::is_trace_enabled()
+                );
+            }
+            (None, None) => {
+                kprintln!(
+                    "trace: timer={} sched={}",
+                    crate::timer::is_trace_enabled(),
+                    crate::scheduler::is_trace_enabled()
+                );
+            }
+            _ => kprintln!("usage: trace <on|off>"),
+        },
+        "brk" => {
+            // SAFETY: `brk #0` triggers an EL1 debug trap handled by `handle_sync_exception`,
+            // which logs the trap and advances `ELR_EL1` past the 4-byte instruction.
+            unsafe {
+                core::arch::asm!("brk #0");
+            }
+        }
+        "clear" => {
+            kprint!("\x1b[2J\x1b[H");
+        }
+        "reboot" => {
+            kprintln!("Rebooting via PSCI...");
+            psci_call(PSCI_SYSTEM_RESET);
+        }
+        "halt" => {
+            kprintln!("Halting via PSCI...");
+            psci_call(PSCI_SYSTEM_OFF);
+        }
+        _ => {
+            kprintln!("unknown command: '{}' (type 'help')", cmd);
+        }
+    }
+}
+
+pub extern "C" fn shell_main() -> ! {
+    let mut buf = [0u8; LINE_BUF_LEN];
+    let mut len = 0usize;
+    let mut last_cr = false;
+
+    kprint!("aegis> ");
+
+    loop {
+        let Some(byte) = crate::uart::try_read_byte() else {
+            // SAFETY: `wfe` places the core in a low-power wait state until an event arrives.
+            unsafe {
+                asm!("wfe", options(nomem, nostack, preserves_flags));
+            }
+            continue;
+        };
+
+        if byte == b'\n' && last_cr {
+            last_cr = false;
+            continue;
+        }
+
+        match byte {
+            b'\r' | b'\n' => {
+                last_cr = byte == b'\r';
+                kprintln!();
+                if let Ok(line) = core::str::from_utf8(&buf[..len]) {
+                    execute(line);
+                }
+                len = 0;
+                kprint!("aegis> ");
+            }
+            0x08 | 0x7F => {
+                last_cr = false;
+                if len > 0 {
+                    len -= 1;
+                    kprint!("\x08 \x08");
+                }
+            }
+            0x20..=0x7E => {
+                last_cr = false;
+                if len < buf.len() {
+                    buf[len] = byte;
+                    len += 1;
+                    crate::uart::write_byte(byte);
+                }
+            }
+            _ => {
+                last_cr = false;
+            }
+        }
+    }
+}
