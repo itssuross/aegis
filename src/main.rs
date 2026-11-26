@@ -9,6 +9,7 @@ use core::panic::PanicInfo;
 mod allocator;
 pub mod blk;
 mod exceptions;
+pub mod fs;
 mod gic;
 mod mmu;
 pub mod sync;
