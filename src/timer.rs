@@ -3,7 +3,6 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const TICK_HZ: u64 = 100;
 
-static TICK_INTERVAL: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -44,10 +43,16 @@ fn write_cntp_ctl(val: u64) {
 }
 
 pub fn init() {
-    let interval = read_cntfrq() / TICK_HZ;
-    TICK_INTERVAL.store(interval, Ordering::Relaxed);
-    write_cntp_tval(interval);
+    init_cpu();
+}
+
+pub fn init_cpu() {
+    reload();
     write_cntp_ctl(1); // ENABLE=1, IMASK=0
+}
+
+fn reload() {
+    write_cntp_tval(read_cntfrq() / TICK_HZ);
 }
 
 pub fn set_trace(enabled: bool) {
@@ -70,11 +75,26 @@ pub fn frequency_hz() -> u64 {
     read_cntfrq()
 }
 
-pub fn handle_tick() {
-    let interval = TICK_INTERVAL.load(Ordering::Relaxed);
-    write_cntp_tval(interval);
-    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if TRACE_ENABLED.load(Ordering::Relaxed) {
-        crate::kprintln!("[timer] tick #{}", tick);
+pub fn handle_tick() -> bool {
+    reload();
+    crate::smp::current_cpu()
+        .ticks
+        .fetch_add(1, Ordering::Relaxed);
+
+    let boot_cpu = crate::smp::cpu_id() == 0;
+    if boot_cpu {
+        let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+        if TRACE_ENABLED.load(Ordering::Relaxed) {
+            crate::kprintln!("[timer] tick #{}", tick);
+        }
+    }
+    boot_cpu
+}
+
+pub fn handle_irq(iar: u32) {
+    let boot_cpu = handle_tick();
+    crate::gic::end_of_interrupt(iar);
+    if boot_cpu {
+        crate::scheduler::on_timer_tick();
     }
 }
