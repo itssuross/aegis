@@ -29,6 +29,8 @@ unsafe extern "C" {
     static __heap_end: u8;
 }
 
+pub static DEMO_WORKERS_DONE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 fn current_el() -> u64 {
     let el: u64;
     // SAFETY: `CurrentEL` is readable at EL1.
@@ -146,6 +148,7 @@ extern "C" fn worker_alpha() -> ! {
             scheduler::sleep_ms(250);
         }
     }
+    DEMO_WORKERS_DONE.fetch_add(1, core::sync::atomic::Ordering::Release);
     scheduler::scheduler_thread_exit();
 }
 
@@ -156,6 +159,7 @@ extern "C" fn worker_beta() -> ! {
             scheduler::sleep_ms(400);
         }
     }
+    DEMO_WORKERS_DONE.fetch_add(1, core::sync::atomic::Ordering::Release);
     scheduler::scheduler_thread_exit();
 }
 
