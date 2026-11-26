@@ -1,16 +1,17 @@
 use core::arch::asm;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub const MAX_CPUS: usize = 4;
 
 const PSCI_CPU_ON: u64 = 0xC400_0003; // PSCI 64-bit CPU_ON function ID
 const BOOT_SPIN_LIMIT: usize = 10_000_000;
 
-static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(1);
+static ONLINE_CPUS: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(C, align(64))]
 pub struct CpuLocal {
     pub cpu_id: usize,
+    pub online: AtomicBool,
     pub ticks: AtomicU64,
     pub ctx_switches: AtomicU64,
     pub idle_ticks: AtomicU64,
@@ -20,6 +21,7 @@ impl CpuLocal {
     const fn new(cpu_id: usize) -> Self {
         Self {
             cpu_id,
+            online: AtomicBool::new(false),
             ticks: AtomicU64::new(0),
             ctx_switches: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
@@ -39,6 +41,9 @@ unsafe extern "C" {
 }
 
 pub fn init_cpu_local(cpu_id: usize) {
+    if cpu_id == 0 {
+        mark_cpu_online(0);
+    }
     let address = &CPU_LOCALS[cpu_id] as *const CpuLocal as u64;
     // SAFETY: This EL1 core stores the address of a static CpuLocal in its TPIDR_EL1.
     unsafe {
@@ -81,9 +86,17 @@ pub fn online_cpus() -> usize {
 }
 
 pub fn mark_cpu_online(id: usize) {
-    if id > 0 && id < MAX_CPUS {
+    if id < MAX_CPUS && !CPU_LOCALS[id].online.swap(true, Ordering::AcqRel) {
         ONLINE_CPUS.fetch_add(1, Ordering::Release);
     }
+}
+
+pub fn record_ctx_switch() {
+    current_cpu().ctx_switches.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_idle_tick() {
+    current_cpu().idle_ticks.fetch_add(1, Ordering::Relaxed);
 }
 
 fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
@@ -107,7 +120,6 @@ pub fn boot_secondary_cores() {
     let entry = secondary_entry as *const () as usize as u64;
 
     for cpu in 1..MAX_CPUS {
-        let before = ONLINE_CPUS.load(Ordering::Acquire);
         let ret = psci_cpu_on(cpu as u64, entry, cpu as u64);
         if ret != 0 {
             crate::kprintln!("[smp] PSCI CPU_ON failed for core {}: {}", cpu, ret);
@@ -115,7 +127,7 @@ pub fn boot_secondary_cores() {
         }
 
         for _ in 0..BOOT_SPIN_LIMIT {
-            if ONLINE_CPUS.load(Ordering::Acquire) > before {
+            if CPU_LOCALS[cpu].online.load(Ordering::Acquire) {
                 break;
             }
             core::hint::spin_loop();
