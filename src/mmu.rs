@@ -1,11 +1,22 @@
 use core::arch::asm;
 
+pub const USER_MEM_BASE: usize = 0x4200_0000;
+pub const USER_MEM_SIZE: usize = 0x0020_0000;
+
 const ENTRIES_PER_TABLE: usize = 512;
 const L1_BLOCK_SIZE: u64 = 1 << 30;
+const L2_BLOCK_SIZE: u64 = 1 << 21;
+const USER_L2_INDEX: usize = (USER_MEM_BASE - L1_BLOCK_SIZE as usize) / USER_MEM_SIZE;
+
+const _: () = assert!(USER_L2_INDEX == 16);
+const _: () = assert!(USER_MEM_SIZE as u64 == L2_BLOCK_SIZE);
 
 const DESC_BLOCK: u64 = 0b01;
+const DESC_TABLE: u64 = 0b11;
 const ATTR_INDX_NORMAL: u64 = 0 << 2;
 const ATTR_INDX_DEVICE: u64 = 1 << 2;
+const AP_EL1_RW: u64 = 0b00 << 6;
+const AP_EL0_RW: u64 = 0b01 << 6;
 const SH_INNER: u64 = 0b11 << 8;
 const AF: u64 = 1 << 10;
 const PXN: u64 = 1 << 53;
@@ -44,19 +55,33 @@ static mut L1_TABLE: PageTable = PageTable {
     entries: [0; ENTRIES_PER_TABLE],
 };
 
+static mut L2_RAM_TABLE: PageTable = PageTable {
+    entries: [0; ENTRIES_PER_TABLE],
+};
+
 pub fn init() {
     // SAFETY: Called once on the single boot core with the MMU disabled; no other references
-    // to `L1_TABLE` exist while it is populated.
-    let table = unsafe { &mut *(&raw mut L1_TABLE) };
+    // to `L1_TABLE` or `L2_RAM_TABLE` exist while they are populated.
+    let (l1_table, l2_table) =
+        unsafe { (&mut *(&raw mut L1_TABLE), &mut *(&raw mut L2_RAM_TABLE)) };
 
-    table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AF | PXN | UXN;
-    table.entries[1] = L1_BLOCK_SIZE | DESC_BLOCK | ATTR_INDX_NORMAL | SH_INNER | AF | UXN;
+    for (index, entry) in l2_table.entries.iter_mut().enumerate() {
+        let block_pa = L1_BLOCK_SIZE + (index as u64) * L2_BLOCK_SIZE;
+        *entry = if index == USER_L2_INDEX {
+            block_pa | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL0_RW | SH_INNER | AF | PXN
+        } else {
+            block_pa | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN
+        };
+    }
+
+    l1_table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AF | PXN | UXN;
+    l1_table.entries[1] = (&raw const L2_RAM_TABLE as u64) | DESC_TABLE;
 
     let ttbr0 = &raw const L1_TABLE as u64;
     let sctlr_flags = SCTLR_M | SCTLR_C | SCTLR_I;
 
-    // SAFETY: `L1_TABLE` identity-maps all memory the kernel touches (code, data, stack, heap,
-    // and MMIO), so execution continues seamlessly once SCTLR_EL1.M is set.
+    // SAFETY: `L1_TABLE` and `L2_RAM_TABLE` identity-map all memory the kernel touches (code,
+    // data, stack, heap, and MMIO), so execution continues seamlessly once SCTLR_EL1.M is set.
     unsafe {
         asm!(
             "msr mair_el1, {mair}",
