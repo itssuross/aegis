@@ -1,4 +1,5 @@
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 
 use crate::{kprint, kprintln};
 
@@ -67,6 +68,7 @@ fn execute(line: &str) {
             kprintln!("Available commands:");
             kprintln!("  help            Show this command list");
             kprintln!("  info            Show kernel version, EL, MIDR_EL1, MMU, and timer freq");
+            kprintln!("  cpuinfo         Show per-core timer and scheduler counters");
             kprintln!("  uptime          Show uptime in seconds");
             kprintln!("  mem             Show heap bounds and allocated/free bytes");
             kprintln!("  ps              List active kernel threads");
@@ -92,6 +94,36 @@ fn execute(line: &str) {
             kprintln!("  MMU        : {}", mmu_status);
             kprintln!("  CNTFRQ_EL0 : {} Hz", crate::timer::frequency_hz());
         }
+        "cpuinfo" => {
+            use crate::smp::{MAX_CPUS, cpu_local, online_cpus};
+
+            kprintln!("online: {}/{}", online_cpus(), MAX_CPUS);
+            kprintln!(
+                "{:<3} {:<7} {:>12} {:>12} {:>12}",
+                "CPU",
+                "STATE",
+                "TICKS",
+                "IDLE",
+                "CTX_SW"
+            );
+            for id in 0..MAX_CPUS {
+                let cpu = cpu_local(id).unwrap();
+                let state = if cpu.online.load(Ordering::Acquire) {
+                    "ONLINE"
+                } else {
+                    "OFFLINE"
+                };
+                let idle = cpu.idle_ticks.load(Ordering::Relaxed);
+                kprintln!(
+                    "{:<3} {:<7} {:>12} {:>12} {:>12}",
+                    id,
+                    state,
+                    cpu.ticks.load(Ordering::Relaxed),
+                    idle,
+                    cpu.ctx_switches.load(Ordering::Relaxed)
+                );
+            }
+        }
         "uptime" => {
             let ms = crate::timer::uptime_ms();
             kprintln!("uptime: {}.{:02}s", ms / 1000, (ms % 1000) / 10);
@@ -110,9 +142,10 @@ fn execute(line: &str) {
             kprintln!("  free      : {} bytes", free);
         }
         "ps" => {
-            kprintln!("{:<4} {:<9} {}", "TID", "STATE", "NAME");
+            kprintln!("{:<4} {:<9} {:<3} {}", "TID", "STATE", "CPU", "NAME");
             for info in crate::scheduler::snapshot().into_iter().flatten() {
-                kprintln!("{:<4} {:<9} {}", info.id, info.state, info.name);
+                let cpu = info.cpu.map_or('-', |id| char::from(b'0' + id as u8));
+                kprintln!("{:<4} {:<9} {:<3} {}", info.id, info.state, cpu, info.name);
             }
         }
         "blkinfo" => match crate::blk::info() {
