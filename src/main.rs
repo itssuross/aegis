@@ -7,6 +7,7 @@ use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
 mod allocator;
+pub mod blk;
 mod exceptions;
 mod gic;
 mod mmu;
@@ -15,6 +16,7 @@ mod scheduler;
 mod shell;
 mod timer;
 mod uart;
+pub mod virtio;
 
 global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
@@ -108,6 +110,20 @@ pub extern "C" fn kmain() -> ! {
         allocated,
         free
     );
+
+    if blk::init() {
+        if let Some((slot, base, sectors)) = blk::info() {
+            kprintln!(
+                "[blk] virtio-blk slot={} mmio={:#x} sectors={} ({} KiB)",
+                slot,
+                base,
+                sectors,
+                sectors / 2
+            );
+        }
+    } else {
+        kprintln!("[blk] no virtio-blk device found");
+    }
 
     scheduler::init();
     scheduler::spawn("worker-alpha", worker_alpha);
