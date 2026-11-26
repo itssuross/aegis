@@ -17,6 +17,7 @@ mod scheduler;
 mod shell;
 mod timer;
 mod uart;
+pub mod user;
 pub mod virtio;
 
 global_asm!(include_str!("boot.S"));
