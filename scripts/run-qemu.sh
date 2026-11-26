@@ -12,4 +12,4 @@ if ! [ -f disk.img ] || ! head -c 512 disk.img | grep -aq "ustar" || ! grep -aq 
     trap - EXIT
     dd if=/dev/zero of=disk.img bs=512 count=0 seek=128 2>/dev/null
 fi
-exec qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -serial mon:stdio -global virtio-mmio.force-legacy=false -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel "$@"
+exec qemu-system-aarch64 -M virt -cpu cortex-a72 -smp 4 -m 128M -nographic -serial mon:stdio -global virtio-mmio.force-legacy=false -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel "$@"
