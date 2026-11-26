@@ -5,7 +5,7 @@ target = "aarch64-unknown-none"
 runner = [
     "sh",
     "-c",
-    "[ -f disk.img ] || dd if=/dev/zero of=disk.img bs=1024 count=64 2>/dev/null && exec qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -serial mon:stdio -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel \"$1\"",
+    "[ -f disk.img ] || dd if=/dev/zero of=disk.img bs=1024 count=64 2>/dev/null && exec qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -serial mon:stdio -global virtio-mmio.force-legacy=false -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel \"$1\"",
     "--",
 ]
 rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]
