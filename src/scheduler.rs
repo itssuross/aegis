@@ -168,7 +168,6 @@ pub fn init() {
 }
 
 pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
-    // Allocate and zero in place so callers on 16 KiB stacks can spawn threads.
     // SAFETY: An array of u128 is valid with every byte set to zero.
     let mut stack = unsafe { Box::<[u128; 1024]>::new_zeroed().assume_init() };
     let sp = stack.as_mut_ptr().wrapping_add(stack.len()) as u64;
