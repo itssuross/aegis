@@ -75,26 +75,21 @@ pub fn frequency_hz() -> u64 {
     read_cntfrq()
 }
 
-pub fn handle_tick() -> bool {
+pub fn handle_irq(iar: u32) {
     reload();
     crate::smp::current_cpu()
         .ticks
         .fetch_add(1, Ordering::Relaxed);
 
-    let boot_cpu = crate::smp::cpu_id() == 0;
-    if boot_cpu {
+    if crate::scheduler::is_current_idle() {
+        crate::smp::record_idle_tick();
+    }
+    if crate::smp::cpu_id() == 0 {
         let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
         if TRACE_ENABLED.load(Ordering::Relaxed) {
             crate::kprintln!("[timer] tick #{}", tick);
         }
     }
-    boot_cpu
-}
-
-pub fn handle_irq(iar: u32) {
-    let boot_cpu = handle_tick();
     crate::gic::end_of_interrupt(iar);
-    if boot_cpu {
-        crate::scheduler::on_timer_tick();
-    }
+    crate::scheduler::on_timer_tick();
 }
