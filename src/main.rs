@@ -45,7 +45,7 @@ pub extern "C" fn kmain() -> ! {
     let el = current_el();
     assert_eq!(el, 1, "expected kernel to run at EL1");
 
-    kprintln!("Aegis Kernel v0.1.0 booted on AArch64 (EL{})", el);
+    kprintln!("Aegis Kernel v0.2.0 booted on AArch64 (EL{})", el);
 
     exceptions::init();
     mmu::init();
