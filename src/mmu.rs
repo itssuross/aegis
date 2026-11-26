@@ -59,6 +59,37 @@ static mut L2_RAM_TABLE: PageTable = PageTable {
     entries: [0; ENTRIES_PER_TABLE],
 };
 
+unsafe fn enable_mmu_on_current_cpu() {
+    let ttbr0 = &raw const L1_TABLE as u64;
+    let sctlr_flags = SCTLR_M | SCTLR_C | SCTLR_I;
+
+    // SAFETY: Caller guarantees `L1_TABLE` and `L2_RAM_TABLE` are initialized and identity-map all
+    // memory the kernel touches (code, data, stack, heap, and MMIO), so execution continues
+    // seamlessly once SCTLR_EL1.M is set.
+    unsafe {
+        asm!(
+            "msr mair_el1, {mair}",
+            "msr tcr_el1, {tcr}",
+            "msr ttbr0_el1, {ttbr0}",
+            "dsb ish",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            "mrs {tmp}, sctlr_el1",
+            "orr {tmp}, {tmp}, {flags}",
+            "msr sctlr_el1, {tmp}",
+            "isb",
+            mair = in(reg) MAIR_VALUE,
+            tcr = in(reg) TCR_VALUE,
+            ttbr0 = in(reg) ttbr0,
+            flags = in(reg) sctlr_flags,
+            tmp = out(reg) _,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 pub fn init() {
     // SAFETY: Called once on the single boot core with the MMU disabled; no other references
     // to `L1_TABLE` or `L2_RAM_TABLE` exist while they are populated.
@@ -77,31 +108,19 @@ pub fn init() {
     l1_table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AF | PXN | UXN;
     l1_table.entries[1] = (&raw const L2_RAM_TABLE as u64) | DESC_TABLE;
 
-    let ttbr0 = &raw const L1_TABLE as u64;
-    let sctlr_flags = SCTLR_M | SCTLR_C | SCTLR_I;
-
-    // SAFETY: `L1_TABLE` and `L2_RAM_TABLE` identity-map all memory the kernel touches (code,
-    // data, stack, heap, and MMIO), so execution continues seamlessly once SCTLR_EL1.M is set.
+    // SAFETY: `L1_TABLE` and `L2_RAM_TABLE` were just populated with identity mappings for all
+    // kernel memory and MMIO.
     unsafe {
-        asm!(
-            "msr mair_el1, {mair}",
-            "msr tcr_el1, {tcr}",
-            "msr ttbr0_el1, {ttbr0}",
-            "dsb ish",
-            "tlbi vmalle1",
-            "dsb ish",
-            "isb",
-            "mrs {tmp}, sctlr_el1",
-            "orr {tmp}, {tmp}, {flags}",
-            "msr sctlr_el1, {tmp}",
-            "isb",
-            mair = in(reg) MAIR_VALUE,
-            tcr = in(reg) TCR_VALUE,
-            ttbr0 = in(reg) ttbr0,
-            flags = in(reg) sctlr_flags,
-            tmp = out(reg) _,
-            options(nostack, preserves_flags),
-        );
+        enable_mmu_on_current_cpu();
+    }
+}
+
+// SAFETY: Core 0 must have completed `mmu::init()` before any secondary core calls this, and the
+// caller must execute at EL1 with the MMU disabled.
+pub unsafe fn init_secondary() {
+    // SAFETY: Caller guarantees `L1_TABLE` and `L2_RAM_TABLE` are already initialized and immutable.
+    unsafe {
+        enable_mmu_on_current_cpu();
     }
 }
 
