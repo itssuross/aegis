@@ -20,8 +20,6 @@ switch_context:
     mov sp, x9
     ret
 
-// Preserve the FP/SIMD registers required by the C calling convention on
-// the outgoing stack. A new thread returns directly to its trampoline.
 .global switch_context_with_fp
 switch_context_with_fp:
     sub sp, sp, #80
