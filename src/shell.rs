@@ -226,6 +226,10 @@ fn execute(line: &str) {
 }
 
 pub extern "C" fn shell_main() -> ! {
+    while crate::DEMO_WORKERS_DONE.load(core::sync::atomic::Ordering::Acquire) < 2 {
+        crate::scheduler::sleep_ms(20);
+    }
+
     let mut buf = [0u8; LINE_BUF_LEN];
     let mut len = 0usize;
     let mut last_cr = false;
