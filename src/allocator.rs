@@ -6,22 +6,17 @@ use core::ops::{Deref, DerefMut};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-/// Every block address and size is a multiple of this, so any split remainder is either
-/// zero or large enough to hold a `FreeBlock` header.
 const BLOCK_ALIGN: usize = 16;
 const MIN_BLOCK_SIZE: usize = size_of::<FreeBlock>();
 
 const _: () = assert!(MIN_BLOCK_SIZE <= BLOCK_ALIGN);
 
-/// Header stored in-place at the start of every free heap region.
 #[repr(C)]
 struct FreeBlock {
     size: usize,
     next: *mut FreeBlock,
 }
 
-/// Spinlock that masks IRQs on the local core while held, so IRQ handlers can never
-/// deadlock against an interrupted lock holder.
 struct IrqSpinLock<T> {
     locked: AtomicBool,
     data: UnsafeCell<T>,
@@ -96,7 +91,6 @@ impl<T> Drop for IrqSpinLockGuard<'_, T> {
     }
 }
 
-/// Address-ordered free list with a sentinel head node.
 struct Heap {
     head: FreeBlock,
     allocated: usize,
@@ -112,11 +106,9 @@ fn align_up(addr: usize, align: usize) -> Option<usize> {
     Some(addr.checked_add(align - 1)? & !(align - 1))
 }
 
-/// Rounds a request up to the allocator's internal block size and alignment.
 #[inline]
 fn block_layout(layout: Layout) -> (usize, usize) {
     let align = layout.align().max(BLOCK_ALIGN);
-    // `Layout::size()` never exceeds `isize::MAX`, so this cannot overflow.
     let size = (layout.size().max(MIN_BLOCK_SIZE) + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
     (size, align)
 }
@@ -132,8 +124,7 @@ impl Heap {
         }
     }
 
-    /// # Safety
-    /// `start..start + size` must be unused, writable memory owned exclusively by the heap.
+    // SAFETY: `start..start + size` must be unused, writable memory owned exclusively by the heap.
     unsafe fn init(&mut self, start: usize, size: usize) {
         self.head.next = ptr::null_mut();
         self.allocated = 0;
@@ -172,8 +163,6 @@ impl Heap {
                     && let Some(alloc_end) = alloc_start.checked_add(size)
                     && alloc_end <= block_end
                 {
-                    // Both remainders are multiples of BLOCK_ALIGN, so a non-zero remainder
-                    // always fits a `FreeBlock` header.
                     let front = alloc_start - block_start;
                     let back = block_end - alloc_end;
                     let next = (*cur).next;
@@ -205,8 +194,7 @@ impl Heap {
         ptr::null_mut()
     }
 
-    /// # Safety
-    /// `ptr` must have been returned by `alloc` on this heap with the same `layout`.
+    // SAFETY: `ptr` must have been returned by `alloc` on this heap with the same `layout`.
     unsafe fn dealloc(&mut self, ptr: *mut u8, layout: Layout) {
         let (size, _) = block_layout(layout);
         let addr = ptr as usize;
@@ -224,13 +212,11 @@ impl Heap {
             let mut merged_size = size;
             let mut merged_next = next;
 
-            // Coalesce with the following free block.
             if !next.is_null() && addr + size == next as usize {
                 merged_size += (*next).size;
                 merged_next = (*next).next;
             }
 
-            // Coalesce with the preceding free block, otherwise insert a new node.
             if prev != head && prev as usize + (*prev).size == addr {
                 (*prev).size += merged_size;
                 (*prev).next = merged_next;
@@ -281,17 +267,14 @@ static ALLOCATOR: KernelAllocator = KernelAllocator {
     heap: IrqSpinLock::new(Heap::empty()),
 };
 
-/// Initializes the kernel heap over `heap_start..heap_start + heap_size`.
-///
-/// # Safety
-/// The region must be unused, writable memory reserved exclusively for the heap, and this must
-/// be called before any allocation and not while allocations are outstanding.
+// SAFETY: `heap_start..heap_start + heap_size` must be unused, writable memory reserved
+// exclusively for the heap, and this must be called before any allocation and not while
+// allocations are outstanding.
 pub unsafe fn init(heap_start: usize, heap_size: usize) {
     // SAFETY: Forwarded from the caller's contract.
     unsafe { ALLOCATOR.heap.lock().init(heap_start, heap_size) }
 }
 
-/// Returns `(allocated_bytes, free_bytes)`.
 pub fn stats() -> (usize, usize) {
     let heap = ALLOCATOR.heap.lock();
     (heap.allocated, heap.free_bytes())
