@@ -1,6 +1,16 @@
 use core::arch::{asm, naked_asm};
 
+const EC_SVC_AARCH64: u64 = 0x15;
 const EC_BRK_AARCH64: u64 = 0x3C;
+
+const SYS_WRITE: u64 = 64;
+const SYS_EXIT: u64 = 93;
+const SYS_SCHED_YIELD: u64 = 124;
+const SYS_SLEEP_MS: u64 = 200;
+
+const EBADF: i64 = -9;
+const EFAULT: i64 = -14;
+const ENOSYS: i64 = -38;
 
 #[repr(C)]
 #[allow(dead_code)]
@@ -10,6 +20,19 @@ pub struct TrapFrame {
     pub elr_el1: u64,
     pub spsr_el1: u64,
 }
+
+#[repr(C)]
+#[allow(dead_code)]
+pub struct El0TrapFrame {
+    pub regs: [u64; 31],
+    pub elr_el1: u64,
+    pub spsr_el1: u64,
+    pub sp_el0: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<El0TrapFrame>() == 272);
+const _: () = assert!(core::mem::offset_of!(El0TrapFrame, elr_el1) == 248);
+const _: () = assert!(core::mem::offset_of!(El0TrapFrame, spsr_el1) == 256);
 
 unsafe extern "C" {
     static exception_vector_table: u8;
@@ -79,6 +102,70 @@ pub extern "C" fn handle_sync_exception(frame: &mut TrapFrame) {
         "synchronous EL1 exception: EC={:#x}, ESR_EL1={:#018x}, FAR_EL1={:#018x}, ELR_EL1={:#018x}",
         ec, esr, far, frame.elr_el1
     );
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn handle_el0_sync(frame: &mut El0TrapFrame) {
+    let esr = read_esr_el1();
+    let ec = (esr >> 26) & 0x3F;
+
+    if ec == EC_SVC_AARCH64 {
+        match frame.regs[8] {
+            SYS_WRITE => {
+                let fd = frame.regs[0];
+                let ptr = frame.regs[1] as usize;
+                let len = frame.regs[2] as usize;
+                if fd != 1 && fd != 2 {
+                    frame.regs[0] = EBADF as u64;
+                    return;
+                }
+                let user_end = crate::mmu::USER_MEM_BASE + crate::mmu::USER_MEM_SIZE;
+                let Some(end) = ptr.checked_add(len) else {
+                    frame.regs[0] = EFAULT as u64;
+                    return;
+                };
+                if ptr < crate::mmu::USER_MEM_BASE
+                    || end > user_end
+                    || (len == 0 && ptr >= user_end)
+                {
+                    frame.regs[0] = EFAULT as u64;
+                    return;
+                }
+                // SAFETY: `[ptr, ptr + len)` lies strictly within the single-core EL0 RAM
+                // region (`USER_MEM_BASE..user_end`), which is mapped RW and initialized.
+                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+                for &byte in bytes {
+                    crate::uart::write_byte(byte);
+                }
+                frame.regs[0] = len as u64;
+            }
+            SYS_EXIT => {
+                crate::user::exit_to_el1(frame.regs[0] as i32);
+            }
+            SYS_SCHED_YIELD => {
+                crate::scheduler::yield_now();
+                frame.regs[0] = 0;
+            }
+            SYS_SLEEP_MS => {
+                crate::scheduler::sleep_ms(frame.regs[0]);
+                frame.regs[0] = 0;
+            }
+            _ => {
+                frame.regs[0] = ENOSYS as u64;
+            }
+        }
+        return;
+    }
+
+    let far = read_far_el1();
+    crate::kprintln!(
+        "[user] EL0 fault EC={:#x} ESR={:#x} ELR={:#x} FAR={:#x}",
+        ec,
+        esr,
+        frame.elr_el1,
+        far
+    );
+    crate::user::exit_to_el1(-1);
 }
 
 #[unsafe(export_name = "handle_irq_exception")]
