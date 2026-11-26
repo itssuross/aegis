@@ -14,10 +14,8 @@ const CR: usize = 0x30;
 const IMSC: usize = 0x38;
 const ICR: usize = 0x44;
 
-// FR flag bits: RXFE (receive FIFO empty), TXFF (transmit FIFO full).
 const FR_RXFE: u32 = 1 << 4;
 const FR_TXFF: u32 = 1 << 5;
-// IMSC / ICR bits: RXIM (receive interrupt), RTIM (receive timeout interrupt).
 const IMSC_RXIM: u32 = 1 << 4;
 const IMSC_RTIM: u32 = 1 << 6;
 
@@ -82,26 +80,19 @@ fn write_reg(offset: usize, value: u32) {
 }
 
 pub fn init() {
-    // Disable UART while configuring control and line parameters.
     write_reg(CR, 0);
-
-    // Clear all pending interrupts.
     write_reg(ICR, 0x7FF);
 
-    // Configure 115200 baud for QEMU virt's 24 MHz UARTCLK:
-    // divisor = 24_000_000 / (16 * 115_200) = 13.0208... -> IBRD = 13, FBRD = 1.
+    // 115200 baud @ 24 MHz UARTCLK
     write_reg(IBRD, 13);
     write_reg(FBRD, 1);
 
-    // Enable FIFOs (bit 4) and configure 8-bit word length (bits 6:5 = 0b11).
-    write_reg(LCR_H, (1 << 4) | (3 << 5));
+    write_reg(LCR_H, (1 << 4) | (3 << 5)); // FEN | WLEN=8
 
-    // Unmask RX (bit 4) and RX timeout (bit 6) interrupts and clear pending flags.
     write_reg(IMSC, IMSC_RXIM | IMSC_RTIM);
     write_reg(ICR, 0x7FF);
 
-    // Enable UART (bit 0), TX (bit 8), and RX (bit 9).
-    write_reg(CR, (1 << 0) | (1 << 8) | (1 << 9));
+    write_reg(CR, (1 << 0) | (1 << 8) | (1 << 9)); // UARTEN | TXE | RXE
 }
 
 pub fn handle_irq() {
