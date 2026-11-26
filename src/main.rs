@@ -63,6 +63,7 @@ pub extern "C" fn kmain() -> ! {
     }
 
     gic::init();
+    scheduler::init();
     smp::boot_secondary_cores();
     kprintln!(
         "[smp] active cores: {}/{}",
@@ -139,7 +140,6 @@ pub extern "C" fn kmain() -> ! {
         kprintln!("[blk] no virtio-blk device found");
     }
 
-    scheduler::init();
     scheduler::spawn("worker-alpha", worker_alpha);
     scheduler::spawn("worker-beta", worker_beta);
     scheduler::spawn("shell", shell::shell_main);
@@ -160,6 +160,7 @@ pub extern "C" fn secondary_main(cpu_id: usize) -> ! {
 
     assert_eq!(smp::cpu_id(), cpu_id, "secondary MPIDR mismatch");
     smp::init_cpu_local(cpu_id);
+    scheduler::init_secondary(cpu_id);
     gic::init_cpu();
     timer::init_cpu();
     kprintln!("[smp] core {} online (EL1, MMU enabled)", cpu_id);
