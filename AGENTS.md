@@ -11,6 +11,13 @@
 - Add zero external crates to `Cargo.toml` unless the user explicitly authorizes them. Write drivers, allocators, and synchronization primitives from scratch.
 - C code, C headers, and assembly-generating C build scripts are forbidden.
 
+## Comment Hygiene
+
+- Ban narrative comments, line-by-line commentary, section banners, and redundant doc-block bloat.
+- Allow comments ONLY for:
+  - `// SAFETY:` invariants on `unsafe` blocks and functions.
+  - Brief inline hardware register, bitfield, or offset notes that are not obvious from symbol names.
+
 ## Git Commit Protocol (MANDATORY)
 
 - Give every created or modified file its own dedicated, atomic Git commit immediately after editing and completing any required verification.
