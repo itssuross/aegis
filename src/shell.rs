@@ -71,6 +71,8 @@ fn execute(line: &str) {
             kprintln!("  mem             Show heap bounds and allocated/free bytes");
             kprintln!("  ps              List active kernel threads");
             kprintln!("  blkinfo         Show virtio-blk device slot, MMIO base, and capacity");
+            kprintln!("  ls              List files and directories");
+            kprintln!("  cat <file>      Show file contents");
             kprintln!("  trace <on|off>  Toggle live timer and scheduler trace logging");
             kprintln!("  brk             Trigger a live BRK #0 synchronous trap");
             kprintln!("  clear           Clear the serial terminal");
@@ -124,6 +126,39 @@ fn execute(line: &str) {
                 kprintln!("blkinfo: no virtio-blk device attached");
             }
         },
+        "ls" => {
+            if let Err(error) = crate::fs::list_entries(|entry| {
+                let kind = if entry.is_dir { "DIR " } else { "FILE" };
+                kprintln!("{} {:>8} {}", kind, entry.size, entry.name());
+            }) {
+                kprintln!("ls: {}", error);
+            }
+        }
+        "cat" => {
+            let path = trimmed[cmd.len()..].trim();
+            if path.is_empty() {
+                kprintln!("usage: cat <file>");
+                return;
+            }
+            match crate::fs::read_file(path) {
+                Ok(bytes) => {
+                    for chunk in bytes.utf8_chunks() {
+                        for ch in chunk.valid().chars() {
+                            if !ch.is_control() || matches!(ch, '\n' | '\t') {
+                                kprint!("{}", ch);
+                            }
+                        }
+                        if !chunk.invalid().is_empty() {
+                            kprint!("\u{FFFD}");
+                        }
+                    }
+                    if !bytes.ends_with(b"\n") {
+                        kprintln!();
+                    }
+                }
+                Err(error) => kprintln!("cat: {}", error),
+            }
+        }
         "trace" => match (arg, extra) {
             (Some("on"), None) => {
                 crate::timer::set_trace(true);
