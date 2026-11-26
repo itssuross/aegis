@@ -4,7 +4,6 @@ use crate::{kprint, kprintln};
 
 const LINE_BUF_LEN: usize = 128;
 
-// ARM PSCI 0.2 function IDs (HVC conduit on QEMU virt).
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
@@ -146,7 +145,6 @@ fn execute(line: &str) {
             }
         }
         "clear" => {
-            // ANSI clear screen and move cursor home.
             kprint!("\x1b[2J\x1b[H");
         }
         "reboot" => {
@@ -195,7 +193,6 @@ pub extern "C" fn shell_main() -> ! {
                 len = 0;
                 kprint!("aegis> ");
             }
-            // ASCII backspace and delete.
             0x08 | 0x7F => {
                 last_cr = false;
                 if len > 0 {
