@@ -5,7 +5,21 @@ target = "aarch64-unknown-none"
 runner = [
     "sh",
     "-c",
-    "[ -f disk.img ] || dd if=/dev/zero of=disk.img bs=1024 count=64 2>/dev/null && exec qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -serial mon:stdio -global virtio-mmio.force-legacy=false -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel \"$1\"",
+    '''
+set -e
+if ! [ -f disk.img ] || ! head -c 512 disk.img | grep -aq "ustar"; then
+    tmpdir=$(mktemp -d)
+    trap 'rm -f "$tmpdir/motd.txt" "$tmpdir/readme.txt"; rmdir "$tmpdir"' EXIT
+    printf '%s\n' 'Welcome to Aegis v0.2.0!' > "$tmpdir/motd.txt"
+    printf '%s\n' 'To pack your own files, run tar --format ustar -cf disk.img -C path/to/files .' > "$tmpdir/readme.txt"
+    tar --format ustar -cf disk.img -C "$tmpdir" .
+    rm "$tmpdir/motd.txt" "$tmpdir/readme.txt"
+    rmdir "$tmpdir"
+    trap - EXIT
+    dd if=/dev/zero of=disk.img bs=512 count=0 seek=128 2>/dev/null
+fi
+exec qemu-system-aarch64 -M virt -cpu cortex-a72 -m 128M -nographic -serial mon:stdio -global virtio-mmio.force-legacy=false -drive file=disk.img,if=none,format=raw,id=hd0 -device virtio-blk-device,drive=hd0 -kernel "$1"
+''',
     "--",
 ]
 rustflags = ["-C", "link-arg=-Tlinker.ld", "-C", "relocation-model=static"]
