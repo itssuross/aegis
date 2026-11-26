@@ -70,6 +70,7 @@ fn execute(line: &str) {
             kprintln!("  uptime          Show uptime in seconds");
             kprintln!("  mem             Show heap bounds and allocated/free bytes");
             kprintln!("  ps              List active kernel threads");
+            kprintln!("  blkinfo         Show virtio-blk device slot, MMIO base, and capacity");
             kprintln!("  trace <on|off>  Toggle live timer and scheduler trace logging");
             kprintln!("  brk             Trigger a live BRK #0 synchronous trap");
             kprintln!("  clear           Clear the serial terminal");
@@ -111,6 +112,18 @@ fn execute(line: &str) {
                 kprintln!("{:<4} {:<9} {}", info.id, info.state, info.name);
             }
         }
+        "blkinfo" => match crate::blk::info() {
+            Some((slot, base, sectors)) => {
+                kprintln!("virtio-blk:");
+                kprintln!("  slot     : {}", slot);
+                kprintln!("  mmio     : {:#010x}", base);
+                kprintln!("  sectors  : {} (512 B each)", sectors);
+                kprintln!("  capacity : {} KiB", sectors / 2);
+            }
+            None => {
+                kprintln!("blkinfo: no virtio-blk device attached");
+            }
+        },
         "trace" => match (arg, extra) {
             (Some("on"), None) => {
                 crate::timer::set_trace(true);
