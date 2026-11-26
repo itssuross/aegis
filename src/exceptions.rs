@@ -2,7 +2,6 @@ use core::arch::{asm, naked_asm};
 
 const EC_BRK_AARCH64: u64 = 0x3C;
 
-/// Saved EL1 exception register frame matching the 272-byte stack layout in `exceptions.S`.
 #[repr(C)]
 #[allow(dead_code)]
 pub struct TrapFrame {
@@ -85,8 +84,6 @@ pub extern "C" fn handle_sync_exception(frame: &mut TrapFrame) {
 #[unsafe(export_name = "handle_irq_exception")]
 #[unsafe(naked)]
 pub extern "C" fn irq_entry(_frame: &mut TrapFrame) {
-    // The vector stub has saved the integer registers. Save FP/SIMD state
-    // before Rust code can clobber it, and keep it on the interrupted stack.
     naked_asm!(
         "sub sp, sp, #544",
         "stp q0, q1, [sp, #0]",
