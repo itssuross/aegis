@@ -89,7 +89,8 @@ fn execute(line: &str) {
             kprintln!("  CNTFRQ_EL0 : {} Hz", crate::timer::frequency_hz());
         }
         "uptime" => {
-            kprintln!("uptime: {}s", crate::timer::ticks());
+            let ms = crate::timer::uptime_ms();
+            kprintln!("uptime: {}.{:02}s", ms / 1000, (ms % 1000) / 10);
         }
         "mem" => {
             let heap_start = &raw const __heap_start as usize;
@@ -170,11 +171,7 @@ pub extern "C" fn shell_main() -> ! {
 
     loop {
         let Some(byte) = crate::uart::try_read_byte() else {
-            // SAFETY: `wfe` can suspend this core until an event or IRQ arrives.
-            unsafe {
-                asm!("wfe", options(nomem, nostack, preserves_flags));
-            }
-            crate::scheduler::yield_now();
+            crate::uart::wait_for_input();
             continue;
         };
 
