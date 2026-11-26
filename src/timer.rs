@@ -45,8 +45,7 @@ pub fn init() {
     let freq = read_cntfrq();
     TICK_INTERVAL.store(freq, Ordering::Relaxed);
     write_cntp_tval(freq);
-    // Enable physical timer (ENABLE = 1, IMASK = 0).
-    write_cntp_ctl(1);
+    write_cntp_ctl(1); // ENABLE=1, IMASK=0
 }
 
 pub fn set_trace(enabled: bool) {
