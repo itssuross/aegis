@@ -2,9 +2,9 @@
 .global _start
 
 _start:
-    mrs x0, mpidr_el1
-    and x0, x0, #0xFF
-    cbnz x0, park
+    mrs x1, mpidr_el1
+    and x1, x1, #0xff // Aff0 core ID
+    cbnz x1, .Lpark_core
 
     mrs x0, CurrentEL
     lsr x0, x0, #2
@@ -44,7 +44,36 @@ bss_zero_loop:
 
 bss_zero_done:
     bl kmain
+    b .Lpark_core
 
-park:
+.global secondary_entry
+secondary_entry:
+    msr daifset, #0xf // mask D, A, I, F
+
+    mov x1, #(3 << 20) // CPACR_EL1.FPEN
+    msr cpacr_el1, x1
+    isb
+
+    adrp x1, exception_vector_table
+    add x1, x1, :lo12:exception_vector_table
+    msr vbar_el1, x1
+    isb
+
+    sub x1, x0, #1
+    lsl x1, x1, #14 // 16384 bytes per core
+    adrp x2, secondary_stacks
+    add x2, x2, :lo12:secondary_stacks
+    add x2, x2, x1
+    add x2, x2, #16384
+    mov sp, x2
+
+    bl secondary_main
+
+.Lpark_core:
     wfe
-    b park
+    b .Lpark_core
+
+.section .bss
+.balign 16
+secondary_stacks:
+    .space 3 * 16384
