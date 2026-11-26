@@ -1,6 +1,7 @@
 /target
 *.bin
 *.img
+/disk.img
 .DS_Store
 .vscode/
 .idea/
