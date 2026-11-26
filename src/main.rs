@@ -47,6 +47,7 @@ pub extern "C" fn kmain() -> ! {
 
     let el = current_el();
     assert_eq!(el, 1, "expected kernel to run at EL1");
+    smp::init_cpu_local(0);
 
     kprintln!("Aegis Kernel v0.2.0 booted on AArch64 (EL{})", el);
 
@@ -61,6 +62,7 @@ pub extern "C" fn kmain() -> ! {
         allocator::init(heap_start, heap_end - heap_start);
     }
 
+    gic::init();
     smp::boot_secondary_cores();
     kprintln!(
         "[smp] active cores: {}/{}",
@@ -142,7 +144,6 @@ pub extern "C" fn kmain() -> ! {
     scheduler::spawn("worker-beta", worker_beta);
     scheduler::spawn("shell", shell::shell_main);
 
-    gic::init();
     timer::init();
     exceptions::enable_irqs();
     kprintln!("Aegis interrupts & {}Hz timer active", timer::TICK_HZ);
@@ -158,13 +159,21 @@ pub extern "C" fn secondary_main(cpu_id: usize) -> ! {
     }
 
     assert_eq!(smp::cpu_id(), cpu_id, "secondary MPIDR mismatch");
+    smp::init_cpu_local(cpu_id);
+    gic::init_cpu();
+    timer::init_cpu();
     kprintln!("[smp] core {} online (EL1, MMU enabled)", cpu_id);
     smp::mark_cpu_online(cpu_id);
 
+    // SAFETY: This core has initialized its vectors, banked GIC interface, and timer.
+    unsafe {
+        core::arch::asm!("msr daifclr, #2", options(nomem, nostack));
+    }
+
     loop {
-        // SAFETY: Secondary cores remain parked in low-power wait until assigned work.
+        // SAFETY: IRQs are enabled and can wake this core from WFI.
         unsafe {
-            core::arch::asm!("wfe", options(nomem, nostack));
+            core::arch::asm!("wfi", options(nomem, nostack));
         }
     }
 }
