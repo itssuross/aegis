@@ -39,18 +39,25 @@ static RX_RING: RxRingBuffer = RxRingBuffer {
     tail: AtomicUsize::new(0),
 };
 
+static RX_WAITQ: crate::scheduler::WaitQueue = crate::scheduler::WaitQueue::new();
+
 impl RxRingBuffer {
-    fn push(&self, byte: u8) {
+    fn push(&self, byte: u8) -> bool {
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head.wrapping_sub(tail) == RX_BUF_SIZE {
-            return;
+            return false;
         }
         // SAFETY: Slot `head & RX_BUF_MASK` is exclusively owned by the producer until `head` advances.
         unsafe {
-            self.buf.get().cast::<u8>().add(head & RX_BUF_MASK).write(byte);
+            self.buf
+                .get()
+                .cast::<u8>()
+                .add(head & RX_BUF_MASK)
+                .write(byte);
         }
         self.head.store(head.wrapping_add(1), Ordering::Release);
+        true
     }
 
     fn pop(&self) -> Option<u8> {
@@ -83,8 +90,7 @@ pub fn init() {
     write_reg(CR, 0);
     write_reg(ICR, 0x7FF);
 
-    // 115200 baud @ 24 MHz UARTCLK
-    write_reg(IBRD, 13);
+    write_reg(IBRD, 13); // 115200 baud @ 24 MHz UARTCLK
     write_reg(FBRD, 1);
 
     write_reg(LCR_H, (1 << 4) | (3 << 5)); // FEN | WLEN=8
@@ -96,20 +102,27 @@ pub fn init() {
 }
 
 pub fn handle_irq() {
+    let mut received = false;
     while (read_reg(FR) & FR_RXFE) == 0 {
         let byte = (read_reg(DR) & 0xFF) as u8;
-        RX_RING.push(byte);
+        received |= RX_RING.push(byte);
     }
     write_reg(ICR, IMSC_RXIM | IMSC_RTIM);
+    if received {
+        RX_WAITQ.wake_one();
+    }
 }
 
 pub fn try_read_byte() -> Option<u8> {
     RX_RING.pop()
 }
 
-#[allow(dead_code, reason = "the idle loops wire up this API in a separate commit")]
 pub fn has_pending_input() -> bool {
     RX_RING.head.load(Ordering::Acquire) != RX_RING.tail.load(Ordering::Acquire)
+}
+
+pub fn wait_for_input() {
+    RX_WAITQ.wait_until(has_pending_input);
 }
 
 fn put_raw_byte(byte: u8) {
