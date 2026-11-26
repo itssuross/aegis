@@ -6,7 +6,6 @@
 .endm
 
 .macro save_trap_frame
-    // Allocate 272-byte (0x110, 16-byte aligned) TrapFrame on the kernel stack.
     sub sp, sp, #272
     stp x0,  x1,  [sp, #0]
     stp x2,  x3,  [sp, #16]
@@ -42,25 +41,21 @@ unhandled_vec_\idx:
 .balign 0x800
 .global exception_vector_table
 exception_vector_table:
-    // Current EL with SP_EL0 (entries 0..3)
     vector_entry unhandled_vec_0
     vector_entry unhandled_vec_1
     vector_entry unhandled_vec_2
     vector_entry unhandled_vec_3
 
-    // Current EL with SP_ELx (entries 4..7)
     vector_entry el1h_sync
     vector_entry el1h_irq
     vector_entry unhandled_vec_6
     vector_entry unhandled_vec_7
 
-    // Lower EL using AArch64 (entries 8..11)
     vector_entry unhandled_vec_8
     vector_entry unhandled_vec_9
     vector_entry unhandled_vec_10
     vector_entry unhandled_vec_11
 
-    // Lower EL using AArch32 (entries 12..15)
     vector_entry unhandled_vec_12
     vector_entry unhandled_vec_13
     vector_entry unhandled_vec_14
