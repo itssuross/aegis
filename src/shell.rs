@@ -86,7 +86,7 @@ fn execute(line: &str) {
             } else {
                 "disabled"
             };
-            kprintln!("Aegis v0.1.0 (aarch64-unknown-none)");
+            kprintln!("Aegis v0.2.0 (aarch64-unknown-none)");
             kprintln!("  CurrentEL  : EL{}", read_current_el());
             kprintln!("  MIDR_EL1   : {:#010x}", read_midr_el1());
             kprintln!("  MMU        : {}", mmu_status);
