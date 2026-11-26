@@ -227,11 +227,7 @@ extern "C" fn handle_irq_exception(_frame: &mut TrapFrame) {
     let irq_id = iar & 0x3FF;
 
     match irq_id {
-        crate::gic::TIMER_IRQ_ID => {
-            crate::timer::handle_tick();
-            crate::gic::end_of_interrupt(iar);
-            crate::scheduler::on_timer_tick();
-        }
+        crate::gic::TIMER_IRQ_ID => crate::timer::handle_irq(iar),
         crate::gic::UART0_IRQ_ID => {
             crate::uart::handle_irq();
             crate::gic::end_of_interrupt(iar);
