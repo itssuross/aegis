@@ -32,7 +32,7 @@ static mut EL1_RETURN_CTX: El1ReturnCtx = El1ReturnCtx {
     exit_code: 0,
 };
 
-static EL0_ACTIVE: AtomicBool = AtomicBool::new(false);
+static EL0_BUSY: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn read_u16(buf: &[u8], offset: usize) -> u16 {
@@ -77,6 +77,7 @@ unsafe extern "C" fn enter_el0(entry: usize, user_sp: usize) -> i32 {
         "stp  x29, x30, [x9, #80]",
         "mov  x10, sp",
         "mrs  x11, daif",
+        "msr  daifset, #2",
         "stp  x10, x11, [x9, #96]",
         "msr  sp_el0, x1",
         "msr  elr_el1, x0",
@@ -145,15 +146,25 @@ unsafe extern "C" fn restore_el1(code: i32) -> ! {
 
 pub fn exit_to_el1(code: i32) -> ! {
     assert!(
-        EL0_ACTIVE.swap(false, Ordering::AcqRel),
+        EL0_BUSY.load(Ordering::Acquire),
         "exit_to_el1 called with no active EL0 task"
     );
-    // SAFETY: `EL0_ACTIVE` was true, proving `enter_el0` saved a live EL1 continuation
-    // (`x19`–`x30`, `sp`, and `daif`) into `EL1_RETURN_CTX` on the current kernel stack.
+    // SAFETY: The EL0 exit and fault handlers resume the pinned owner of EL1_RETURN_CTX.
     unsafe { restore_el1(code) }
 }
 
 pub fn exec_elf(image: &[u8]) -> Result<i32, &'static str> {
+    EL0_BUSY
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .map_err(|_| "EL0 busy")?;
+    crate::scheduler::set_current_pinned(true);
+    let result = load_and_run(image);
+    crate::scheduler::set_current_pinned(false);
+    EL0_BUSY.store(false, Ordering::Release);
+    result
+}
+
+fn load_and_run(image: &[u8]) -> Result<i32, &'static str> {
     if image.len() < ELF_HDR_SIZE {
         return Err("elf: image shorter than 64-byte header");
     }
@@ -229,12 +240,8 @@ pub fn exec_elf(image: &[u8]) -> Result<i32, &'static str> {
         return Err("elf: no PT_LOAD segments");
     }
 
-    if EL0_ACTIVE.swap(true, Ordering::AcqRel) {
-        return Err("elf: user task already active");
-    }
-
     // SAFETY: `USER_MEM_BASE..user_end` is identity-mapped RW for EL1 and owned exclusively
-    // while `EL0_ACTIVE` is set; every `PT_LOAD` slice and destination range was bounds-checked.
+    // while `EL0_BUSY` is set; every `PT_LOAD` slice and destination range was bounds-checked.
     unsafe {
         core::ptr::write_bytes(USER_MEM_BASE as *mut u8, 0, USER_MEM_SIZE);
         for index in 0..phnum {
@@ -268,7 +275,7 @@ pub fn exec_elf(image: &[u8]) -> Result<i32, &'static str> {
     }
 
     // SAFETY: `entry` and `user_end` lie within the isolated EL0 2 MiB region, I-cache is
-    // coherent with loaded code, and `EL0_ACTIVE` grants exclusive access to `EL1_RETURN_CTX`.
+    // coherent with loaded code, and `EL0_BUSY` grants exclusive access to `EL1_RETURN_CTX`.
     let status = unsafe { enter_el0(entry, user_end) };
     Ok(status)
 }
