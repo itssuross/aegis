@@ -14,10 +14,8 @@ const GICC_PMR: usize = 0x004;
 const GICC_IAR: usize = 0x00C;
 const GICC_EOIR: usize = 0x010;
 
-/// Non-secure EL1 physical timer interrupt ID (PPI 14 -> IRQ 30).
-pub const TIMER_IRQ_ID: u32 = 30;
-/// PL011 UART0 interrupt ID (SPI 1 -> IRQ 33).
-pub const UART0_IRQ_ID: u32 = 33;
+pub const TIMER_IRQ_ID: u32 = 30; // PPI 14
+pub const UART0_IRQ_ID: u32 = 33; // SPI 1
 
 #[inline]
 fn write_gicd(offset: usize, value: u32) {
@@ -44,23 +42,17 @@ fn write_gicc(offset: usize, value: u32) {
 }
 
 pub fn init() {
-    // Disable Distributor while configuring interrupts.
     write_gicd(GICD_CTLR, 0);
 
-    // Enable IRQ 30 (Non-secure EL1 physical timer) in GICD_ISENABLER0.
     write_gicd(GICD_ISENABLER0, 1 << TIMER_IRQ_ID);
-    // Set highest priority (0x00) for IRQ 30 in GICD_IPRIORITYR.
     write_gicd_byte(GICD_IPRIORITYR + (TIMER_IRQ_ID as usize), 0x00);
 
-    // Enable IRQ 33 (UART0 SPI 1, bit 1) in GICD_ISENABLER1, priority 0x00, routed to CPU 0 (0x01).
     write_gicd(GICD_ISENABLER1, 1 << (UART0_IRQ_ID - 32));
     write_gicd_byte(GICD_IPRIORITYR + (UART0_IRQ_ID as usize), 0x00);
-    write_gicd_byte(GICD_ITARGETSR + (UART0_IRQ_ID as usize), 0x01);
+    write_gicd_byte(GICD_ITARGETSR + (UART0_IRQ_ID as usize), 0x01); // CPU 0
 
-    // Re-enable Distributor.
     write_gicd(GICD_CTLR, 1);
 
-    // Allow all interrupt priorities on the CPU interface and enable it.
     write_gicc(GICC_PMR, 0xFF);
     write_gicc(GICC_CTLR, 1);
 }
