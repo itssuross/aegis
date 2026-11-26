@@ -15,6 +15,7 @@ mod mmu;
 pub mod sync;
 mod scheduler;
 mod shell;
+pub mod smp;
 mod timer;
 mod uart;
 pub mod user;
@@ -59,6 +60,13 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         allocator::init(heap_start, heap_end - heap_start);
     }
+
+    smp::boot_secondary_cores();
+    kprintln!(
+        "[smp] active cores: {}/{}",
+        smp::online_cpus(),
+        smp::MAX_CPUS
+    );
 
     // SAFETY: The EL1 breakpoint handler advances `ELR_EL1` past `brk #0`.
     unsafe {
@@ -139,6 +147,26 @@ pub extern "C" fn kmain() -> ! {
     exceptions::enable_irqs();
     kprintln!("Aegis interrupts & {}Hz timer active", timer::TICK_HZ);
     idle();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn secondary_main(cpu_id: usize) -> ! {
+    // SAFETY: Core 0 finished `mmu::init()` before issuing PSCI CPU_ON, and this core is at EL1
+    // with the MMU disabled.
+    unsafe {
+        mmu::init_secondary();
+    }
+
+    assert_eq!(smp::cpu_id(), cpu_id, "secondary MPIDR mismatch");
+    kprintln!("[smp] core {} online (EL1, MMU enabled)", cpu_id);
+    smp::mark_cpu_online(cpu_id);
+
+    loop {
+        // SAFETY: Secondary cores remain parked in low-power wait until assigned work.
+        unsafe {
+            core::arch::asm!("wfe", options(nomem, nostack));
+        }
+    }
 }
 
 extern "C" fn worker_alpha() -> ! {
