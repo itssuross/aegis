@@ -1,9 +1,11 @@
 use alloc::boxed::Box;
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::smp::{self, MAX_CPUS};
 use crate::sync::{IrqSpinLock, irq_restore, irq_save_disable};
 
-const MAX_THREADS: usize = 8;
+const MAX_THREADS: usize = MAX_CPUS + 7;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -37,6 +39,7 @@ unsafe extern "C" {
 pub struct ThreadInfo {
     pub id: usize,
     pub name: &'static str,
+    pub cpu: Option<usize>,
     pub state: &'static str,
 }
 
@@ -62,6 +65,8 @@ impl ThreadState {
 struct Thread {
     id: usize,
     name: &'static str,
+    pub cpu: Option<usize>,
+    pub pinned_cpu: Option<usize>,
     state: ThreadState,
     wake_tick_ms: Option<u64>,
     context: CpuContext,
@@ -71,30 +76,121 @@ struct Thread {
 
 struct Scheduler {
     threads: [Option<Thread>; MAX_THREADS],
-    current: usize,
+    current: [usize; MAX_CPUS],
 }
 
-static SCHEDULER: IrqSpinLock<Scheduler> = IrqSpinLock::new(Scheduler {
-    threads: [const { None }; MAX_THREADS],
-    current: 0,
-});
+struct SchedulerLock {
+    held: AtomicBool,
+    state: UnsafeCell<Scheduler>,
+}
+
+// SAFETY: Every access to state requires the IRQ-masked scheduler lock.
+unsafe impl Sync for SchedulerLock {}
+
+static SCHEDULER: SchedulerLock = SchedulerLock {
+    held: AtomicBool::new(false),
+    state: UnsafeCell::new(Scheduler {
+        threads: [const { None }; MAX_THREADS],
+        current: [0, 1, 2, 3],
+    }),
+};
+
+struct SchedulerGuard {
+    daif: u64,
+    not_send: core::marker::PhantomData<*mut ()>,
+}
+
+impl SchedulerGuard {
+    fn lock() -> Self {
+        let daif = irq_save_disable();
+        while SCHEDULER
+            .held
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+        Self {
+            daif,
+            not_send: core::marker::PhantomData,
+        }
+    }
+
+    fn state(&mut self) -> &mut Scheduler {
+        // SAFETY: The unique guard holds the lock for the lifetime of this borrow.
+        unsafe { &mut *SCHEDULER.state.get() }
+    }
+}
+
+impl Drop for SchedulerGuard {
+    fn drop(&mut self) {
+        post_switch_unlock(self.daif);
+    }
+}
+
+extern "C" fn post_switch_unlock(daif: u64) {
+    SCHEDULER.held.store(false, Ordering::Release);
+    irq_restore(daif);
+}
+
+#[unsafe(naked)]
+extern "C" fn first_switch_entry() -> ! {
+    core::arch::naked_asm!(
+        "mrs x0, daif",
+        "bl {unlock}",
+        "b {entry}",
+        unlock = sym post_switch_unlock,
+        entry = sym thread_entry_trampoline,
+    );
+}
 
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
-    let mut scheduler = SCHEDULER.lock();
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
     assert!(
         scheduler.threads[0].is_none(),
         "scheduler already initialized"
     );
-    scheduler.threads[0] = Some(Thread {
-        id: 0,
-        name: "idle",
-        state: ThreadState::Running,
-        wake_tick_ms: None,
-        context: CpuContext::default(),
-        stack: None,
-    });
+    let names = ["idle-0", "idle-1", "idle-2", "idle-3"];
+    for (cpu, name) in names.into_iter().enumerate() {
+        scheduler.threads[cpu] = Some(Thread {
+            id: cpu,
+            name,
+            cpu: (cpu == 0).then_some(cpu),
+            pinned_cpu: Some(cpu),
+            state: if cpu == 0 {
+                ThreadState::Running
+            } else {
+                ThreadState::Ready
+            },
+            wake_tick_ms: None,
+            context: CpuContext::default(),
+            stack: None,
+        });
+    }
+}
+
+pub fn init_secondary(cpu_id: usize) {
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
+    scheduler.current[cpu_id] = cpu_id;
+    let idle = scheduler.threads[cpu_id].as_mut().unwrap();
+    idle.cpu = Some(cpu_id);
+    idle.state = ThreadState::Running;
+}
+
+pub fn is_current_idle() -> bool {
+    SchedulerGuard::lock().state().current[smp::cpu_id()] < MAX_CPUS
+}
+
+pub fn set_current_pinned(pinned: bool) {
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
+    let cpu = smp::cpu_id();
+    let tid = scheduler.current[cpu];
+    scheduler.threads[tid].as_mut().unwrap().pinned_cpu = (pinned || tid < MAX_CPUS).then_some(cpu);
 }
 
 pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
@@ -103,12 +199,13 @@ pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
     let sp = stack.as_mut_ptr().wrapping_add(stack.len()) as u64;
     let context = CpuContext {
         x19: entry as usize as u64,
-        x30: thread_entry_trampoline as *const () as usize as u64,
+        x30: first_switch_entry as *const () as usize as u64,
         sp,
         ..CpuContext::default()
     };
 
-    let mut scheduler = SCHEDULER.lock();
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
     assert!(scheduler.threads[0].is_some(), "scheduler not initialized");
     let id = scheduler
         .threads
@@ -118,6 +215,8 @@ pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
     scheduler.threads[id] = Some(Thread {
         id,
         name,
+        cpu: None,
+        pinned_cpu: None,
         state: ThreadState::Ready,
         wake_tick_ms: None,
         context,
@@ -136,11 +235,13 @@ pub fn is_trace_enabled() -> bool {
 
 pub fn snapshot() -> [Option<ThreadInfo>; MAX_THREADS] {
     let mut out = [None; MAX_THREADS];
-    let scheduler = SCHEDULER.lock();
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
     for (dst, src) in out.iter_mut().zip(scheduler.threads.iter()) {
         if let Some(thread) = src {
             *dst = Some(ThreadInfo {
                 id: thread.id,
+                cpu: thread.cpu.or(thread.pinned_cpu),
                 name: thread.name,
                 state: thread.state.as_str(),
             });
@@ -149,38 +250,13 @@ pub fn snapshot() -> [Option<ThreadInfo>; MAX_THREADS] {
     out
 }
 
-fn current_tid() -> usize {
-    SCHEDULER.lock().current
-}
-
 pub fn yield_now() {
-    schedule(ThreadState::Ready);
-}
-
-pub fn block_current_masked(saved_daif: u64) {
-    schedule_masked(ThreadState::Blocked);
-    irq_restore(saved_daif);
+    schedule(SchedulerGuard::lock(), ThreadState::Ready);
 }
 
 fn mark_ready(thread: &mut Thread) {
     thread.state = ThreadState::Ready;
     thread.wake_tick_ms = None;
-}
-
-fn try_wake_thread(tid: usize) -> bool {
-    let mut scheduler = SCHEDULER.lock();
-    let Some(thread) = scheduler.threads.get_mut(tid).and_then(Option::as_mut) else {
-        return false;
-    };
-    if thread.state != ThreadState::Blocked {
-        return false;
-    }
-    mark_ready(thread);
-    true
-}
-
-pub fn wake_thread(tid: usize) {
-    try_wake_thread(tid);
 }
 
 pub struct WaitQueue {
@@ -196,51 +272,47 @@ impl WaitQueue {
 
     pub fn wait_until<F: FnMut() -> bool>(&self, mut cond: F) {
         loop {
-            let saved_daif = irq_save_disable();
-            if cond() {
-                irq_restore(saved_daif);
-                return;
-            }
-
-            let tid = current_tid();
-            if tid == 0 {
-                irq_restore(saved_daif);
-                yield_now();
-                continue;
-            }
-
+            let mut guard = SchedulerGuard::lock();
+            let tid = guard.state().current[smp::cpu_id()];
+            // Waiters and wakers acquire the scheduler lock before the queue lock.
             {
                 let mut waiters = self.waiters.lock();
-                let slot = waiters
-                    .iter_mut()
-                    .find(|slot| slot.is_none())
-                    .expect("wait queue full");
-                *slot = Some(tid);
+                if cond() {
+                    return;
+                }
+                if tid >= MAX_CPUS {
+                    let slot = waiters
+                        .iter_mut()
+                        .find(|slot| slot.is_none())
+                        .expect("wait queue full");
+                    *slot = Some(tid);
+                }
             }
-            block_current_masked(saved_daif);
-
-            let mut waiters = self.waiters.lock();
-            if let Some(index) = waiters.iter().position(|&slot| slot == Some(tid)) {
-                Self::remove_waiter(&mut waiters, index);
-            }
+            schedule(
+                guard,
+                if tid < MAX_CPUS {
+                    ThreadState::Ready
+                } else {
+                    ThreadState::Blocked
+                },
+            );
         }
     }
 
     pub fn wake_one(&self) {
+        let mut guard = SchedulerGuard::lock();
         let mut waiters = self.waiters.lock();
-        while let Some(tid) = waiters[0] {
+        if let Some(tid) = waiters[0] {
             Self::remove_waiter(&mut waiters, 0);
-            if try_wake_thread(tid) {
-                break;
-            }
+            mark_ready(guard.state().threads[tid].as_mut().unwrap());
         }
     }
 
     #[allow(dead_code, reason = "current callers only need to wake one waiter")]
     pub fn wake_all(&self) {
-        let mut waiters = self.waiters.lock();
-        for tid in waiters.iter_mut().filter_map(Option::take) {
-            wake_thread(tid);
+        let mut guard = SchedulerGuard::lock();
+        for tid in self.waiters.lock().iter_mut().filter_map(Option::take) {
+            mark_ready(guard.state().threads[tid].as_mut().unwrap());
         }
     }
 
@@ -251,71 +323,66 @@ impl WaitQueue {
 }
 
 pub fn sleep_ms(ms: u64) {
-    let saved_daif = irq_save_disable();
-    let deadline = crate::timer::uptime_ms().saturating_add(ms);
-    {
-        let mut scheduler = SCHEDULER.lock();
-        let tid = scheduler.current;
-        if tid != 0 {
-            let thread = scheduler.threads[tid].as_mut().expect("no current thread");
-            thread.wake_tick_ms = Some(deadline);
-        }
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
+    let tid = scheduler.current[smp::cpu_id()];
+    if tid >= MAX_CPUS {
+        scheduler.threads[tid].as_mut().unwrap().wake_tick_ms =
+            Some(crate::timer::uptime_ms().saturating_add(ms));
+        schedule(guard, ThreadState::Blocked);
     }
-    block_current_masked(saved_daif);
 }
 
 pub fn on_timer_tick() {
     let now = crate::timer::uptime_ms();
-    {
-        let mut scheduler = SCHEDULER.lock();
-        for thread in scheduler.threads.iter_mut().flatten() {
-            if thread.state == ThreadState::Blocked
-                && thread.wake_tick_ms.is_some_and(|deadline| deadline <= now)
-            {
-                mark_ready(thread);
-            }
+    let mut guard = SchedulerGuard::lock();
+    for thread in guard.state().threads.iter_mut().flatten() {
+        if thread.state == ThreadState::Blocked
+            && thread.wake_tick_ms.is_some_and(|deadline| deadline <= now)
+        {
+            mark_ready(thread);
         }
     }
-    yield_now();
+    schedule(guard, ThreadState::Ready);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn scheduler_thread_exit() -> ! {
-    schedule(ThreadState::Finished);
+    schedule(SchedulerGuard::lock(), ThreadState::Finished);
     unreachable!("a finished thread cannot resume");
 }
 
-fn schedule(previous_state: ThreadState) {
-    let saved_daif = irq_save_disable();
-    schedule_masked(previous_state);
-    irq_restore(saved_daif);
-}
-
-fn schedule_masked(previous_state: ThreadState) {
-    let mut scheduler = SCHEDULER.lock();
-    let previous = scheduler.current;
-    if previous == 0 && previous_state == ThreadState::Blocked {
-        return;
-    }
-    let Some(next) = (1..MAX_THREADS)
+fn schedule(mut guard: SchedulerGuard, previous_state: ThreadState) {
+    let scheduler = guard.state();
+    let cpu = smp::cpu_id();
+    let previous = scheduler.current[cpu];
+    let next = (1..MAX_THREADS)
         .map(|offset| (previous + offset) % MAX_THREADS)
         .find(|&slot| {
-            scheduler.threads[slot]
-                .as_ref()
-                .is_some_and(|thread| thread.state == ThreadState::Ready)
+            slot >= MAX_CPUS
+                && scheduler.threads[slot].as_ref().is_some_and(|thread| {
+                    thread.state == ThreadState::Ready
+                        && thread.pinned_cpu.is_none_or(|id| id == cpu)
+                })
         })
-    else {
-        assert!(previous_state == ThreadState::Ready, "no runnable thread");
+        .unwrap_or(if previous_state == ThreadState::Ready {
+            previous
+        } else {
+            cpu
+        });
+    if previous == next {
         return;
-    };
+    }
 
-    scheduler.current = next;
+    scheduler.current[cpu] = next;
     let [prev, next] = scheduler
         .threads
         .get_disjoint_mut([previous, next])
         .unwrap();
     let prev = prev.as_mut().expect("no current thread");
     let next = next.as_mut().expect("no next thread");
+    prev.cpu = None;
+    next.cpu = Some(cpu);
     prev.state = previous_state;
     next.state = ThreadState::Running;
     if TRACE_ENABLED.load(Ordering::Relaxed) {
@@ -329,9 +396,10 @@ fn schedule_masked(previous_state: ThreadState) {
     }
     let prev_ptr = &raw mut prev.context;
     let next_ptr = &raw const next.context;
-    drop(scheduler);
-
-    // SAFETY: Both contexts live at fixed addresses in the static slot array. IRQs
-    // stay masked until the incoming thread resumes its own continuation or trampoline.
+    smp::record_ctx_switch();
+    let daif = guard.daif;
+    core::mem::forget(guard);
+    // SAFETY: The incoming continuation releases the lock only after both stack pointers are switched.
     unsafe { switch_context(prev_ptr, next_ptr) };
+    post_switch_unlock(daif);
 }
