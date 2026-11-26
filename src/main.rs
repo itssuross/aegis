@@ -10,6 +10,7 @@ mod allocator;
 mod exceptions;
 mod gic;
 mod mmu;
+pub mod sync;
 mod scheduler;
 mod shell;
 mod timer;
@@ -116,33 +117,37 @@ pub extern "C" fn kmain() -> ! {
     gic::init();
     timer::init();
     exceptions::enable_irqs();
-    kprintln!("Aegis interrupts & 1Hz timer active");
+    kprintln!("Aegis interrupts & {}Hz timer active", timer::TICK_HZ);
     idle();
 }
 
 extern "C" fn worker_alpha() -> ! {
     for step in 1..=3 {
         kprintln!("[thread:alpha] step {}", step);
+        if step < 3 {
+            scheduler::sleep_ms(250);
+        }
     }
-    idle();
+    scheduler::scheduler_thread_exit();
 }
 
 extern "C" fn worker_beta() -> ! {
     for step in 1..=3 {
         kprintln!("[thread:beta] step {}", step);
+        if step < 3 {
+            scheduler::sleep_ms(400);
+        }
     }
-    idle();
+    scheduler::scheduler_thread_exit();
 }
 
 fn idle() -> ! {
     loop {
-        if !crate::uart::has_pending_input() {
-            // SAFETY: `wfe` can suspend this core until an event or IRQ arrives.
-            unsafe {
-                asm!("wfe", options(nomem, nostack, preserves_flags));
-            }
+        // SAFETY: IRQs are enabled and can wake the idle core from WFI.
+        unsafe {
+            asm!("wfi", options(nomem, nostack, preserves_flags));
         }
-        crate::scheduler::yield_now();
+        scheduler::yield_now();
     }
 }
 
