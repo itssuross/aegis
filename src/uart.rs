@@ -150,8 +150,11 @@ impl Write for UartWriter {
     }
 }
 
+static PRINT_LOCK: crate::sync::IrqSpinLock<()> = crate::sync::IrqSpinLock::new(());
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments<'_>) {
+    let _guard = PRINT_LOCK.lock();
     let mut writer = UartWriter;
     let _ = writer.write_fmt(args);
 }
