@@ -3,7 +3,6 @@ use core::arch::asm;
 const ENTRIES_PER_TABLE: usize = 512;
 const L1_BLOCK_SIZE: u64 = 1 << 30;
 
-// Stage 1 block descriptor fields.
 const DESC_BLOCK: u64 = 0b01;
 const ATTR_INDX_NORMAL: u64 = 0 << 2;
 const ATTR_INDX_DEVICE: u64 = 1 << 2;
@@ -12,18 +11,15 @@ const AF: u64 = 1 << 10;
 const PXN: u64 = 1 << 53;
 const UXN: u64 = 1 << 54;
 
-// MAIR_EL1: Attr0 = 0xFF (Normal, Inner/Outer WB RW-Allocate), Attr1 = 0x00 (Device-nGnRnE).
-const MAIR_VALUE: u64 = 0x00FF;
+const MAIR_VALUE: u64 = 0x00FF; // Attr0=0xFF (Normal WB-RWA), Attr1=0x00 (Device-nGnRnE)
 
-// TCR_EL1 fields.
 const TCR_T0SZ: u64 = 25;
 const TCR_IRGN0_WBWA: u64 = 0b01 << 8;
 const TCR_ORGN0_WBWA: u64 = 0b01 << 10;
 const TCR_SH0_INNER: u64 = 0b11 << 12;
 const TCR_TG0_4K: u64 = 0b00 << 14;
 const TCR_EPD1: u64 = 1 << 23;
-// TG1 = 4KB keeps the (disabled) TTBR1 granule field off its reserved 0b00 encoding.
-const TCR_TG1_4K: u64 = 0b10 << 30;
+const TCR_TG1_4K: u64 = 0b10 << 30; // non-reserved TG1 encoding
 const TCR_IPS_40BIT: u64 = 0b010 << 32;
 
 const TCR_VALUE: u64 = TCR_T0SZ
@@ -35,7 +31,6 @@ const TCR_VALUE: u64 = TCR_T0SZ
     | TCR_TG1_4K
     | TCR_IPS_40BIT;
 
-// SCTLR_EL1: M (MMU enable), C (data cache enable), I (instruction cache enable).
 const SCTLR_M: u64 = 1 << 0;
 const SCTLR_C: u64 = 1 << 2;
 const SCTLR_I: u64 = 1 << 12;
@@ -54,10 +49,7 @@ pub fn init() {
     // to `L1_TABLE` exist while it is populated.
     let table = unsafe { &mut *(&raw mut L1_TABLE) };
 
-    // 0x0000_0000..0x3FFF_FFFF: Device-nGnRnE (GIC, UART), never executable.
     table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AF | PXN | UXN;
-
-    // 0x4000_0000..0x7FFF_FFFF: Normal WB cacheable RAM, Inner Shareable, EL1-executable.
     table.entries[1] = L1_BLOCK_SIZE | DESC_BLOCK | ATTR_INDX_NORMAL | SH_INNER | AF | UXN;
 
     let ttbr0 = &raw const L1_TABLE as u64;
