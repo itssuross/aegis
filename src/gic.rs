@@ -44,15 +44,17 @@ fn write_gicc(offset: usize, value: u32) {
 pub fn init() {
     write_gicd(GICD_CTLR, 0);
 
-    write_gicd(GICD_ISENABLER0, 1 << TIMER_IRQ_ID);
-    write_gicd_byte(GICD_IPRIORITYR + (TIMER_IRQ_ID as usize), 0x00);
-
-    write_gicd(GICD_ISENABLER1, 1 << (UART0_IRQ_ID - 32));
     write_gicd_byte(GICD_IPRIORITYR + (UART0_IRQ_ID as usize), 0x00);
     write_gicd_byte(GICD_ITARGETSR + (UART0_IRQ_ID as usize), 0x01); // CPU 0
+    write_gicd(GICD_ISENABLER1, 1 << (UART0_IRQ_ID - 32));
 
     write_gicd(GICD_CTLR, 1);
+    init_cpu();
+}
 
+pub fn init_cpu() {
+    write_gicd_byte(GICD_IPRIORITYR + (TIMER_IRQ_ID as usize), 0x00);
+    write_gicd(GICD_ISENABLER0, 1 << TIMER_IRQ_ID);
     write_gicc(GICC_PMR, 0xFF);
     write_gicc(GICC_CTLR, 1);
 }
