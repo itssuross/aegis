@@ -73,6 +73,7 @@ fn execute(line: &str) {
             kprintln!("  blkinfo         Show virtio-blk device slot, MMIO base, and capacity");
             kprintln!("  ls              List files and directories");
             kprintln!("  cat <file>      Show file contents");
+            kprintln!("  exec <file>     Load and run an EL0 ELF64 binary");
             kprintln!("  trace <on|off>  Toggle live timer and scheduler trace logging");
             kprintln!("  brk             Trigger a live BRK #0 synchronous trap");
             kprintln!("  clear           Clear the serial terminal");
@@ -157,6 +158,20 @@ fn execute(line: &str) {
                     }
                 }
                 Err(error) => kprintln!("cat: {}", error),
+            }
+        }
+        "exec" => {
+            let path = trimmed[cmd.len()..].trim();
+            if path.is_empty() {
+                kprintln!("usage: exec <file>");
+                return;
+            }
+            match crate::fs::read_file(path) {
+                Ok(bytes) => match crate::user::exec_elf(&bytes) {
+                    Ok(code) => kprintln!("[exec] exited with code {}", code),
+                    Err(error) => kprintln!("exec: {}", error),
+                },
+                Err(error) => kprintln!("exec: {}", error),
             }
         }
         "trace" => match (arg, extra) {
