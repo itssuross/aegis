@@ -1,8 +1,10 @@
 use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
-use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
+use crate::fd::{EBADF, FdKind, FdTable};
 use crate::mmu::{PageFlags, PageTable};
+use crate::pipe::{self, PipeHandle};
 use crate::platform::PAGE_SIZE;
 use crate::scheduler::WaitQueue;
 use crate::sync::IrqSpinLock;
@@ -25,12 +27,22 @@ const USER_STACK_TOP: usize = 0x0080_0000;
 const MAX_PROCS: usize = 16;
 const EXIT_HISTORY_LEN: usize = 32;
 
+const ENOENT: i64 = -2;
+const ESRCH: i64 = -3;
+const EIO: i64 = -5;
+const ENOEXEC: i64 = -8;
+const ECHILD: i64 = -10;
+const EAGAIN: i64 = -11;
+const ENOMEM: i64 = -12;
+const ENFILE: i64 = -23;
+const EMFILE: i64 = -24;
+
 const _: () = assert!(USER_STACK_GUARD + PAGE_SIZE == USER_STACK_BASE);
 const _: () = assert!(USER_STACK_BASE + PAGE_SIZE == USER_STACK_TOP);
 
 static NEXT_ASID: AtomicU16 = AtomicU16::new(1);
 static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
-static REAPER_STARTED: AtomicBool = AtomicBool::new(false);
+static REAPER_STARTED: IrqSpinLock<bool> = IrqSpinLock::new(false);
 static PROC_WAITQ: WaitQueue = WaitQueue::new();
 
 struct UserAddressSpace {
@@ -60,19 +72,28 @@ impl Drop for UserAddressSpace {
 
 struct Process {
     pid: usize,
+    parent_pid: Option<usize>,
     tid: Option<usize>,
     asid: u16,
     entry: usize,
     user_sp: usize,
     addr_space: Option<UserAddressSpace>,
+    fds: Option<FdTable>,
     exit_code: Option<i64>,
     completed: bool,
     reaping: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ExitRecord {
+    pid: usize,
+    parent_pid: Option<usize>,
+    code: i64,
+}
+
 struct ProcessTable {
     procs: [Option<Process>; MAX_PROCS],
-    exits: [Option<(usize, i64)>; EXIT_HISTORY_LEN],
+    exits: [Option<ExitRecord>; EXIT_HISTORY_LEN],
     exit_cursor: usize,
 }
 
@@ -85,29 +106,41 @@ impl ProcessTable {
         }
     }
 
-    fn record_exit(&mut self, pid: usize, exit_code: i64) {
-        let idx = self.exit_cursor;
-        self.exits[idx] = Some((pid, exit_code));
-        self.exit_cursor = (idx + 1) % EXIT_HISTORY_LEN;
+    fn by_tid(&mut self, tid: usize) -> Option<&mut Process> {
+        self.procs
+            .iter_mut()
+            .flatten()
+            .find(|proc| !proc.completed && proc.tid == Some(tid))
+    }
+
+    fn record_exit(&mut self, exit: ExitRecord) {
+        self.exits[self.exit_cursor] = Some(exit);
+        self.exit_cursor = (self.exit_cursor + 1) % EXIT_HISTORY_LEN;
     }
 
     fn take_exit(&mut self, pid: usize) -> Option<i64> {
         for slot in &mut self.exits {
-            if let Some((recorded_pid, code)) = *slot
-                && recorded_pid == pid
-            {
-                *slot = None;
-                return Some(code);
+            if slot.is_some_and(|exit| exit.pid == pid) {
+                return slot.take().map(|exit| exit.code);
             }
         }
         None
     }
 
     fn has_exit(&self, pid: usize) -> bool {
-        self.exits
+        self.exits.iter().flatten().any(|exit| exit.pid == pid)
+    }
+
+    fn has_child(&self, parent_pid: usize, pid: usize) -> bool {
+        self.procs
             .iter()
             .flatten()
-            .any(|&(recorded_pid, _)| recorded_pid == pid)
+            .any(|proc| proc.pid == pid && proc.parent_pid == Some(parent_pid))
+            || self
+                .exits
+                .iter()
+                .flatten()
+                .any(|exit| exit.pid == pid && exit.parent_pid == Some(parent_pid))
     }
 }
 
@@ -256,7 +289,7 @@ extern "C" fn el0_task_entry(proc_idx: usize) -> ! {
     unsafe { enter_el0(entry, user_sp) }
 }
 
-extern "C" fn el0_reaper() -> ! {
+extern "C" fn el0_reaper(_arg: usize) -> ! {
     loop {
         PROC_WAITQ.wait_until(|| {
             let table = PROCESSES.lock();
@@ -277,14 +310,22 @@ extern "C" fn el0_reaper() -> ! {
                         && !proc.reaping
                     {
                         proc.reaping = true;
-                        picked = Some((idx, proc.pid, proc.tid, proc.exit_code.unwrap_or(-1)));
+                        picked = Some((
+                            idx,
+                            proc.tid,
+                            ExitRecord {
+                                pid: proc.pid,
+                                parent_pid: proc.parent_pid,
+                                code: proc.exit_code.unwrap_or(-1),
+                            },
+                        ));
                         break;
                     }
                 }
                 picked
             };
 
-            let Some((proc_idx, pid, tid, exit_code)) = candidate else {
+            let Some((proc_idx, tid, exit)) = candidate else {
                 break;
             };
 
@@ -296,13 +337,13 @@ extern "C" fn el0_reaper() -> ! {
                 let mut table = PROCESSES.lock();
                 let taken = if table.procs[proc_idx]
                     .as_ref()
-                    .is_some_and(|proc| proc.pid == pid)
+                    .is_some_and(|proc| proc.pid == exit.pid)
                 {
                     table.procs[proc_idx].take()
                 } else {
                     None
                 };
-                table.record_exit(pid, exit_code);
+                table.record_exit(exit);
                 taken
             };
             drop(reaped);
@@ -311,13 +352,14 @@ extern "C" fn el0_reaper() -> ! {
     }
 }
 
-fn ensure_reaper_started() {
-    if REAPER_STARTED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
-    {
-        crate::scheduler::spawn("reaper", el0_reaper);
+fn ensure_reaper_started() -> Result<(), &'static str> {
+    let mut started = REAPER_STARTED.lock();
+    if !*started {
+        crate::scheduler::spawn_with_ttbr0("reaper", el0_reaper, 0, crate::mmu::kernel_ttbr0())
+            .ok_or("user: scheduler task slots exhausted")?;
+        *started = true;
     }
+    Ok(())
 }
 
 pub fn exit_to_el1(code: i32) -> ! {
@@ -328,20 +370,21 @@ pub fn exit_to_el1(code: i32) -> ! {
     }
     crate::scheduler::set_current_ttbr0(crate::mmu::kernel_ttbr0());
 
+    let fds = PROCESSES
+        .lock()
+        .by_tid(tid)
+        .and_then(|proc| proc.fds.take());
+    if let Some(mut fds) = fds {
+        fds.close_all();
+    }
+
     let addr_space = {
         let mut table = PROCESSES.lock();
-        let mut released = None;
-        for slot in table.procs.iter_mut() {
-            if let Some(proc) = slot.as_mut()
-                && proc.tid == Some(tid)
-            {
-                proc.exit_code = Some(i64::from(code));
-                proc.completed = true;
-                released = proc.addr_space.take();
-                break;
-            }
-        }
-        released
+        table.by_tid(tid).and_then(|proc| {
+            proc.exit_code = Some(i64::from(code));
+            proc.completed = true;
+            proc.addr_space.take()
+        })
     };
     drop(addr_space);
     PROC_WAITQ.wake_all();
@@ -530,11 +573,11 @@ fn load_elf_image(image: &[u8]) -> Result<(UserAddressSpace, usize), &'static st
 
     let stack_phys = crate::pmm::alloc_frame().ok_or("elf: out of physical memory")?;
     addr_space.frames.push(stack_phys);
-    addr_space
-        .pt
-        .as_mut()
-        .expect("page table missing")
-        .map_4k(USER_STACK_BASE, stack_phys, PageFlags::UserRw)?;
+    addr_space.pt.as_mut().expect("page table missing").map_4k(
+        USER_STACK_BASE,
+        stack_phys,
+        PageFlags::UserRw,
+    )?;
 
     // SAFETY: Ensures PTE and code writes are visible and invalidates stale I-cache lines across SMP cores.
     unsafe {
@@ -550,7 +593,7 @@ fn load_elf_image(image: &[u8]) -> Result<(UserAddressSpace, usize), &'static st
     Ok((addr_space, entry))
 }
 
-fn spawn_process(image: &[u8]) -> Result<usize, &'static str> {
+fn spawn_process(image: &[u8], parent_pid: Option<usize>) -> Result<usize, &'static str> {
     let (mut addr_space, entry) = load_elf_image(image)?;
 
     let (proc_idx, pid, ttbr0) = {
@@ -566,11 +609,13 @@ fn spawn_process(image: &[u8]) -> Result<usize, &'static str> {
         let ttbr0 = addr_space.ttbr0();
         table.procs[slot_idx] = Some(Process {
             pid,
+            parent_pid,
             tid: None,
             asid,
             entry,
             user_sp: USER_STACK_TOP,
             addr_space: Some(addr_space),
+            fds: Some(FdTable::new_stdio()),
             exit_code: None,
             completed: false,
             reaping: false,
@@ -665,19 +710,142 @@ pub fn wait_pid(pid: usize) -> Result<i64, &'static str> {
             }
         };
         drop(reaped);
+        PROC_WAITQ.wake_all();
         return Ok(exit_code);
     }
 }
 
 pub fn exec_elf<'a, S: ElfSource<'a>>(source: S) -> Result<i64, &'static str> {
     let bytes = source.into_elf_bytes()?;
-    let pid = spawn_process(bytes.as_slice())?;
+    let pid = spawn_process(bytes.as_slice(), None)?;
     drop(bytes);
     wait_pid(pid)
 }
 
 pub fn spawn_elf(filename: &str) -> Result<usize, &'static str> {
-    ensure_reaper_started();
+    let tid = crate::scheduler::current_tid();
+    let parent_pid = PROCESSES.lock().by_tid(tid).map(|proc| proc.pid);
     let bytes = crate::fs::read_file(filename)?;
-    spawn_process(&bytes)
+    ensure_reaper_started()?;
+    spawn_process(&bytes, parent_pid)
+}
+
+fn with_current_fds<T>(op: impl FnOnce(&mut FdTable) -> Result<T, i64>) -> Result<T, i64> {
+    let tid = crate::scheduler::current_tid();
+    // Each process has one thread. Blocking I/O runs with its table outside PROCESSES.
+    let mut fds = PROCESSES
+        .lock()
+        .by_tid(tid)
+        .ok_or(ESRCH)?
+        .fds
+        .take()
+        .expect("current process descriptor table in use");
+    let result = op(&mut fds);
+    PROCESSES
+        .lock()
+        .by_tid(tid)
+        .expect("missing current process")
+        .fds = Some(fds);
+    result
+}
+
+pub fn sys_read(fd: usize, buf: &mut [u8]) -> i64 {
+    with_current_fds(|fds| match fds.get_mut(fd) {
+        Some(FdKind::ConsoleIn) => {
+            let mut count = 0;
+            while let Some(dst) = buf.get_mut(count) {
+                if let Some(byte) = crate::uart::try_read_byte() {
+                    *dst = byte;
+                    count += 1;
+                } else if count == 0 {
+                    crate::uart::wait_for_input();
+                } else {
+                    break;
+                }
+            }
+            Ok(count)
+        }
+        Some(FdKind::UstarFile { bytes, offset }) => {
+            let count = buf.len().min(bytes.len() - *offset);
+            buf[..count].copy_from_slice(&bytes[*offset..*offset + count]);
+            *offset += count;
+            Ok(count)
+        }
+        Some(FdKind::PipeRead(end)) => pipe::read(end, buf),
+        _ => Err(EBADF),
+    })
+    .map_or_else(|errno| errno, |count| count as i64)
+}
+
+pub fn sys_write(fd: usize, buf: &[u8]) -> i64 {
+    with_current_fds(|fds| match fds.get(fd) {
+        Some(FdKind::ConsoleOut) => {
+            for &byte in buf {
+                crate::uart::write_byte(byte);
+            }
+            Ok(buf.len())
+        }
+        Some(FdKind::PipeWrite(end)) => pipe::write(end, buf),
+        _ => Err(EBADF),
+    })
+    .map_or_else(|errno| errno, |count| count as i64)
+}
+
+fn file_errno(error: &str) -> i64 {
+    match error {
+        "fs: file not found" => ENOENT,
+        "fs: file too large for available memory" => ENOMEM,
+        _ => EIO,
+    }
+}
+
+pub fn sys_open(path: &str) -> i64 {
+    with_current_fds(|fds| {
+        if !fds.has_capacity(1) {
+            return Err(EMFILE);
+        }
+        let bytes = crate::fs::read_file(path).map_err(file_errno)?;
+        fds.alloc(FdKind::UstarFile { bytes, offset: 0 })
+            .ok_or(EMFILE)
+    })
+    .map_or_else(|errno| errno, |fd| fd as i64)
+}
+
+pub fn sys_close(fd: usize) -> i64 {
+    with_current_fds(|fds| fds.close(fd)).map_or_else(|errno| errno, |()| 0)
+}
+
+pub fn sys_pipe() -> Result<(usize, usize), i64> {
+    with_current_fds(|fds| {
+        if !fds.has_capacity(2) {
+            return Err(EMFILE);
+        }
+        let (read, write) = PipeHandle::create().ok_or(ENFILE)?;
+        let read_fd = fds.alloc(FdKind::PipeRead(read)).expect("free pipe fd");
+        let write_fd = fds.alloc(FdKind::PipeWrite(write)).expect("free pipe fd");
+        Ok((read_fd, write_fd))
+    })
+}
+
+pub fn sys_spawn(path: &str) -> i64 {
+    match spawn_elf(path) {
+        Ok(pid) => pid as i64,
+        Err("user: process table full" | "user: scheduler task slots exhausted") => EAGAIN,
+        Err("elf: out of physical memory") => ENOMEM,
+        Err(error) if error.starts_with("elf:") => ENOEXEC,
+        Err(error) => file_errno(error),
+    }
+}
+
+pub fn sys_waitpid(pid: usize) -> i64 {
+    let tid = crate::scheduler::current_tid();
+    let mut table = PROCESSES.lock();
+    let Some(parent_pid) = table.by_tid(tid).map(|proc| proc.pid) else {
+        return ESRCH;
+    };
+    if !table.has_child(parent_pid, pid) {
+        return ECHILD;
+    }
+    drop(table);
+    wait_pid(pid).unwrap_or(ECHILD)
 }
