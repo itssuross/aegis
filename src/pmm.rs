@@ -1,6 +1,5 @@
 use core::ptr;
 
-use crate::mmu::{USER_MEM_BASE, USER_MEM_SIZE};
 use crate::platform::{PAGE_SHIFT, PAGE_SIZE, RAM_END, RAM_SIZE};
 use crate::sync::IrqSpinLock;
 
@@ -63,19 +62,6 @@ impl PmmState {
     fn is_used(&self, frame: usize) -> bool {
         (self.bitmap[frame / 64] & (1u64 << (frame % 64))) != 0
     }
-
-    fn reserve_range(&mut self, start: usize, end: usize) {
-        let lo = start.max(self.managed_start) & !(PAGE_SIZE - 1);
-        let hi = align_up(end.min(self.managed_end), PAGE_SIZE).min(self.managed_end);
-        if hi <= lo {
-            return;
-        }
-        let first = (lo - self.managed_start) >> PAGE_SHIFT;
-        let last = (hi - self.managed_start) >> PAGE_SHIFT;
-        for frame in first..last.min(self.total_frames) {
-            self.set_used(frame);
-        }
-    }
 }
 
 pub fn init() {
@@ -107,8 +93,6 @@ pub fn init() {
     if rem_bits > 0 {
         state.bitmap[full_words] = !((1u64 << rem_bits) - 1);
     }
-
-    state.reserve_range(USER_MEM_BASE, USER_MEM_BASE + USER_MEM_SIZE);
 }
 
 pub fn alloc_frame() -> Option<usize> {
@@ -196,9 +180,6 @@ pub fn alloc_contiguous(count: usize) -> Option<usize> {
 
 pub fn free_frame(phys: usize) {
     if phys & (PAGE_SIZE - 1) != 0 {
-        return;
-    }
-    if (USER_MEM_BASE..USER_MEM_BASE + USER_MEM_SIZE).contains(&phys) {
         return;
     }
 
