@@ -1,9 +1,10 @@
 use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
-use core::sync::atomic::{AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use crate::mmu::{PageFlags, PageTable};
 use crate::platform::PAGE_SIZE;
+use crate::scheduler::WaitQueue;
 use crate::sync::IrqSpinLock;
 
 const ELF_HDR_SIZE: usize = 64;
@@ -22,11 +23,15 @@ const USER_STACK_GUARD: usize = 0x007F_E000; // 4 KiB unmapped guard page
 const USER_STACK_BASE: usize = 0x007F_F000;
 const USER_STACK_TOP: usize = 0x0080_0000;
 const MAX_PROCS: usize = 16;
+const EXIT_HISTORY_LEN: usize = 32;
 
 const _: () = assert!(USER_STACK_GUARD + PAGE_SIZE == USER_STACK_BASE);
 const _: () = assert!(USER_STACK_BASE + PAGE_SIZE == USER_STACK_TOP);
 
 static NEXT_ASID: AtomicU16 = AtomicU16::new(1);
+static NEXT_PID: AtomicUsize = AtomicUsize::new(1);
+static REAPER_STARTED: AtomicBool = AtomicBool::new(false);
+static PROC_WAITQ: WaitQueue = WaitQueue::new();
 
 struct UserAddressSpace {
     asid: u16,
@@ -43,28 +48,70 @@ impl UserAddressSpace {
 
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
-        for phys in self.frames.drain(..) {
-            crate::pmm::free_frame(phys);
-        }
-        drop(self.pt.take());
         if self.asid != 0 {
             crate::mmu::flush_asid(self.asid);
+        }
+        drop(self.pt.take());
+        for phys in self.frames.drain(..) {
+            crate::pmm::free_frame(phys);
         }
     }
 }
 
 struct Process {
+    pid: usize,
     tid: Option<usize>,
+    asid: u16,
     entry: usize,
     user_sp: usize,
-    addr_space: UserAddressSpace,
+    addr_space: Option<UserAddressSpace>,
     exit_code: Option<i64>,
     completed: bool,
-    detached: bool,
+    reaping: bool,
 }
 
-static PROCESSES: IrqSpinLock<[Option<Process>; MAX_PROCS]> =
-    IrqSpinLock::new([const { None }; MAX_PROCS]);
+struct ProcessTable {
+    procs: [Option<Process>; MAX_PROCS],
+    exits: [Option<(usize, i64)>; EXIT_HISTORY_LEN],
+    exit_cursor: usize,
+}
+
+impl ProcessTable {
+    const fn new() -> Self {
+        Self {
+            procs: [const { None }; MAX_PROCS],
+            exits: [None; EXIT_HISTORY_LEN],
+            exit_cursor: 0,
+        }
+    }
+
+    fn record_exit(&mut self, pid: usize, exit_code: i64) {
+        let idx = self.exit_cursor;
+        self.exits[idx] = Some((pid, exit_code));
+        self.exit_cursor = (idx + 1) % EXIT_HISTORY_LEN;
+    }
+
+    fn take_exit(&mut self, pid: usize) -> Option<i64> {
+        for slot in &mut self.exits {
+            if let Some((recorded_pid, code)) = *slot
+                && recorded_pid == pid
+            {
+                *slot = None;
+                return Some(code);
+            }
+        }
+        None
+    }
+
+    fn has_exit(&self, pid: usize) -> bool {
+        self.exits
+            .iter()
+            .flatten()
+            .any(|&(recorded_pid, _)| recorded_pid == pid)
+    }
+}
+
+static PROCESSES: IrqSpinLock<ProcessTable> = IrqSpinLock::new(ProcessTable::new());
 
 pub enum ElfBytes<'a> {
     Borrowed(&'a [u8]),
@@ -143,11 +190,7 @@ fn alloc_asid(procs: &[Option<Process>; MAX_PROCS]) -> u16 {
                 break cur;
             }
         };
-        if !procs
-            .iter()
-            .flatten()
-            .any(|proc| proc.addr_space.asid == asid)
-        {
+        if !procs.iter().flatten().any(|proc| proc.asid == asid) {
             return asid;
         }
     }
@@ -201,8 +244,8 @@ unsafe extern "C" fn enter_el0(entry: usize, user_sp: usize) -> ! {
 extern "C" fn el0_task_entry(proc_idx: usize) -> ! {
     let tid = crate::scheduler::current_tid();
     let (entry, user_sp) = {
-        let mut procs = PROCESSES.lock();
-        let proc = procs[proc_idx]
+        let mut table = PROCESSES.lock();
+        let proc = table.procs[proc_idx]
             .as_mut()
             .expect("el0_task_entry: missing process control block");
         proc.tid = Some(tid);
@@ -213,6 +256,70 @@ extern "C" fn el0_task_entry(proc_idx: usize) -> ! {
     unsafe { enter_el0(entry, user_sp) }
 }
 
+extern "C" fn el0_reaper() -> ! {
+    loop {
+        PROC_WAITQ.wait_until(|| {
+            let table = PROCESSES.lock();
+            table
+                .procs
+                .iter()
+                .flatten()
+                .any(|proc| proc.completed && !proc.reaping)
+        });
+
+        loop {
+            let candidate = {
+                let mut table = PROCESSES.lock();
+                let mut picked = None;
+                for (idx, slot) in table.procs.iter_mut().enumerate() {
+                    if let Some(proc) = slot.as_mut()
+                        && proc.completed
+                        && !proc.reaping
+                    {
+                        proc.reaping = true;
+                        picked = Some((idx, proc.pid, proc.tid, proc.exit_code.unwrap_or(-1)));
+                        break;
+                    }
+                }
+                picked
+            };
+
+            let Some((proc_idx, pid, tid, exit_code)) = candidate else {
+                break;
+            };
+
+            if let Some(tid) = tid {
+                crate::scheduler::join(tid);
+            }
+
+            let reaped = {
+                let mut table = PROCESSES.lock();
+                let taken = if table.procs[proc_idx]
+                    .as_ref()
+                    .is_some_and(|proc| proc.pid == pid)
+                {
+                    table.procs[proc_idx].take()
+                } else {
+                    None
+                };
+                table.record_exit(pid, exit_code);
+                taken
+            };
+            drop(reaped);
+            PROC_WAITQ.wake_all();
+        }
+    }
+}
+
+fn ensure_reaper_started() {
+    if REAPER_STARTED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        crate::scheduler::spawn("reaper", el0_reaper);
+    }
+}
+
 pub fn exit_to_el1(code: i32) -> ! {
     let tid = crate::scheduler::current_tid();
     // SAFETY: Clearing `SP_EL0` at EL1 before exiting the EL0 thread has no memory side effects.
@@ -221,24 +328,23 @@ pub fn exit_to_el1(code: i32) -> ! {
     }
     crate::scheduler::set_current_ttbr0(crate::mmu::kernel_ttbr0());
 
-    let detached_proc = {
-        let mut procs = PROCESSES.lock();
-        let mut found = None;
-        for slot in procs.iter_mut() {
+    let addr_space = {
+        let mut table = PROCESSES.lock();
+        let mut released = None;
+        for slot in table.procs.iter_mut() {
             if let Some(proc) = slot.as_mut()
                 && proc.tid == Some(tid)
             {
                 proc.exit_code = Some(i64::from(code));
                 proc.completed = true;
-                if proc.detached {
-                    found = slot.take();
-                }
+                released = proc.addr_space.take();
                 break;
             }
         }
-        found
+        released
     };
-    drop(detached_proc);
+    drop(addr_space);
+    PROC_WAITQ.wake_all();
 
     crate::scheduler::exit_current();
 }
@@ -444,63 +550,134 @@ fn load_elf_image(image: &[u8]) -> Result<(UserAddressSpace, usize), &'static st
     Ok((addr_space, entry))
 }
 
-fn spawn_process(image: &[u8], detached: bool) -> Result<(usize, usize), &'static str> {
+fn spawn_process(image: &[u8]) -> Result<usize, &'static str> {
     let (mut addr_space, entry) = load_elf_image(image)?;
 
-    let (proc_idx, ttbr0) = {
-        let mut procs = PROCESSES.lock();
-        let Some(slot_idx) = procs.iter().position(Option::is_none) else {
-            drop(procs);
+    let (proc_idx, pid, ttbr0) = {
+        let mut table = PROCESSES.lock();
+        let Some(slot_idx) = table.procs.iter().position(Option::is_none) else {
+            drop(table);
             drop(addr_space);
             return Err("user: process table full");
         };
-        addr_space.asid = alloc_asid(&procs);
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        let asid = alloc_asid(&table.procs);
+        addr_space.asid = asid;
         let ttbr0 = addr_space.ttbr0();
-        procs[slot_idx] = Some(Process {
+        table.procs[slot_idx] = Some(Process {
+            pid,
             tid: None,
+            asid,
             entry,
             user_sp: USER_STACK_TOP,
-            addr_space,
+            addr_space: Some(addr_space),
             exit_code: None,
             completed: false,
-            detached,
+            reaping: false,
         });
-        (slot_idx, ttbr0)
+        (slot_idx, pid, ttbr0)
     };
 
     let Some(tid) = crate::scheduler::spawn_with_ttbr0("el0", el0_task_entry, proc_idx, ttbr0)
     else {
-        let failed = PROCESSES.lock()[proc_idx].take();
+        let failed = {
+            let mut table = PROCESSES.lock();
+            if table.procs[proc_idx]
+                .as_ref()
+                .is_some_and(|proc| proc.pid == pid)
+            {
+                table.procs[proc_idx].take()
+            } else {
+                None
+            }
+        };
         drop(failed);
         return Err("user: scheduler task slots exhausted");
     };
 
-    Ok((proc_idx, tid))
+    {
+        let mut table = PROCESSES.lock();
+        if let Some(proc) = table.procs[proc_idx].as_mut()
+            && proc.pid == pid
+        {
+            proc.tid = Some(tid);
+        }
+    }
+
+    Ok(pid)
+}
+
+pub fn wait_pid(pid: usize) -> Result<i64, &'static str> {
+    loop {
+        PROC_WAITQ.wait_until(|| {
+            let table = PROCESSES.lock();
+            if table.has_exit(pid) {
+                return true;
+            }
+            match table.procs.iter().flatten().find(|proc| proc.pid == pid) {
+                Some(proc) => proc.completed && !proc.reaping,
+                None => true,
+            }
+        });
+
+        let claim = {
+            let mut table = PROCESSES.lock();
+            if let Some(exit_code) = table.take_exit(pid) {
+                return Ok(exit_code);
+            }
+            let mut found = None;
+            let mut exists = false;
+            for (idx, slot) in table.procs.iter_mut().enumerate() {
+                if let Some(proc) = slot.as_mut()
+                    && proc.pid == pid
+                {
+                    exists = true;
+                    if proc.completed && !proc.reaping {
+                        proc.reaping = true;
+                        found = Some((idx, proc.tid, proc.exit_code.unwrap_or(-1)));
+                    }
+                    break;
+                }
+            }
+            if !exists {
+                return Err("user: unknown pid");
+            }
+            found
+        };
+
+        let Some((proc_idx, tid, exit_code)) = claim else {
+            continue;
+        };
+
+        if let Some(tid) = tid {
+            crate::scheduler::join(tid);
+        }
+
+        let reaped = {
+            let mut table = PROCESSES.lock();
+            if table.procs[proc_idx]
+                .as_ref()
+                .is_some_and(|proc| proc.pid == pid)
+            {
+                table.procs[proc_idx].take()
+            } else {
+                None
+            }
+        };
+        drop(reaped);
+        return Ok(exit_code);
+    }
 }
 
 pub fn exec_elf<'a, S: ElfSource<'a>>(source: S) -> Result<i64, &'static str> {
     let bytes = source.into_elf_bytes()?;
-    let (proc_idx, tid) = spawn_process(bytes.as_slice(), false)?;
+    let pid = spawn_process(bytes.as_slice())?;
     drop(bytes);
-
-    crate::scheduler::join(tid);
-
-    let proc = PROCESSES.lock()[proc_idx].take();
-    let Some(proc) = proc else {
-        return Err("user: missing completed process state");
-    };
-    let exit_code = if proc.completed {
-        proc.exit_code.unwrap_or(-1)
-    } else {
-        -1
-    };
-    drop(proc);
-    Ok(exit_code)
+    wait_pid(pid)
 }
 
-#[allow(dead_code)]
 pub fn spawn_elf(filename: &str) -> Result<usize, &'static str> {
+    ensure_reaper_started();
     let bytes = crate::fs::read_file(filename)?;
-    let (_proc_idx, tid) = spawn_process(&bytes, true)?;
-    Ok(tid)
+    spawn_process(&bytes)
 }
