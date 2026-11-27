@@ -6,6 +6,7 @@ use core::panic::PanicInfo;
 
 const SYS_WRITE: u64 = 64;
 const SYS_EXIT: u64 = 93;
+const SYS_SCHED_YIELD: u64 = 124;
 const SYS_SLEEP_MS: u64 = 200;
 
 fn sys_write(fd: u64, buf: &[u8]) -> isize {
@@ -22,6 +23,18 @@ fn sys_write(fd: u64, buf: &[u8]) -> isize {
         );
     }
     ret
+}
+
+fn sys_sched_yield() {
+    // SAFETY: Invokes Aegis EL0 `SYS_SCHED_YIELD` (`x8 = 124`), yielding the current core voluntarily.
+    unsafe {
+        asm!(
+            "svc #0",
+            in("x8") SYS_SCHED_YIELD,
+            lateout("x0") _,
+            options(nostack),
+        );
+    }
 }
 
 fn sys_sleep_ms(ms: u64) {
@@ -48,11 +61,12 @@ fn sys_exit(code: i32) -> ! {
     }
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     let _ = sys_write(1, b"Hello from EL0 userspace!\n");
+    sys_sched_yield();
     sys_sleep_ms(150);
-    let _ = sys_write(1, b"Syscall sleep & exit verified.\n");
+    let _ = sys_write(1, b"Syscall yield, sleep & exit verified.\n");
     sys_exit(0);
 }
 
