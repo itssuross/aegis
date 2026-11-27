@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use crate::smp::{self, MAX_CPUS};
 use crate::sync::{IrqSpinLock, irq_restore, irq_save_disable};
 
-const MAX_THREADS: usize = MAX_CPUS + 7;
+const MAX_THREADS: usize = MAX_CPUS + 12;
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -67,6 +67,7 @@ struct Thread {
     name: &'static str,
     pub cpu: Option<usize>,
     pub pinned_cpu: Option<usize>,
+    pub ttbr0: u64,
     state: ThreadState,
     wake_tick_ms: Option<u64>,
     context: CpuContext,
@@ -133,12 +134,21 @@ extern "C" fn post_switch_unlock(daif: u64) {
     irq_restore(daif);
 }
 
+extern "C" fn trampoline_switch_ttbr0(ttbr0: u64) {
+    // SAFETY: `ttbr0` was installed on this thread and identity-maps kernel/MMIO regions.
+    unsafe { crate::mmu::switch_ttbr0(ttbr0) };
+}
+
 #[unsafe(naked)]
 extern "C" fn first_switch_entry() -> ! {
     core::arch::naked_asm!(
+        "mov x0, x21",
+        "bl {switch_ttbr0}",
         "mrs x0, daif",
         "bl {unlock}",
+        "mov x0, x20",
         "b {entry}",
+        switch_ttbr0 = sym trampoline_switch_ttbr0,
         unlock = sym post_switch_unlock,
         entry = sym thread_entry_trampoline,
     );
@@ -147,6 +157,7 @@ extern "C" fn first_switch_entry() -> ! {
 static TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn init() {
+    let kernel_ttbr0 = crate::mmu::kernel_ttbr0();
     let mut guard = SchedulerGuard::lock();
     let scheduler = guard.state();
     assert!(
@@ -160,6 +171,7 @@ pub fn init() {
             name,
             cpu: (cpu == 0).then_some(cpu),
             pinned_cpu: Some(cpu),
+            ttbr0: kernel_ttbr0,
             state: if cpu == 0 {
                 ThreadState::Running
             } else {
@@ -185,6 +197,22 @@ pub fn is_current_idle() -> bool {
     SchedulerGuard::lock().state().current[smp::cpu_id()] < MAX_CPUS
 }
 
+pub fn current_tid() -> usize {
+    SchedulerGuard::lock().state().current[smp::cpu_id()]
+}
+
+pub fn set_current_ttbr0(ttbr0: u64) {
+    let mut guard = SchedulerGuard::lock();
+    let scheduler = guard.state();
+    let tid = scheduler.current[smp::cpu_id()];
+    if let Some(thread) = scheduler.threads[tid].as_mut() {
+        thread.ttbr0 = ttbr0;
+    }
+    // SAFETY: `ttbr0` is a valid page table identity-mapping kernel/MMIO regions while IRQs are masked.
+    unsafe { crate::mmu::switch_ttbr0(ttbr0) };
+}
+
+#[allow(dead_code)]
 pub fn set_current_pinned(pinned: bool) {
     let mut guard = SchedulerGuard::lock();
     let scheduler = guard.state();
@@ -193,12 +221,14 @@ pub fn set_current_pinned(pinned: bool) {
     scheduler.threads[tid].as_mut().unwrap().pinned_cpu = (pinned || tid < MAX_CPUS).then_some(cpu);
 }
 
-pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
+fn spawn_raw(name: &'static str, entry_addr: u64, arg: usize, ttbr0: u64) -> Option<usize> {
     // SAFETY: An array of u128 is valid with every byte set to zero.
     let mut stack = unsafe { Box::<[u128; 1024]>::new_zeroed().assume_init() };
     let sp = stack.as_mut_ptr().wrapping_add(stack.len()) as u64;
     let context = CpuContext {
-        x19: entry as usize as u64,
+        x19: entry_addr,
+        x20: arg as u64,
+        x21: ttbr0,
         x30: first_switch_entry as *const () as usize as u64,
         sp,
         ..CpuContext::default()
@@ -207,22 +237,66 @@ pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
     let mut guard = SchedulerGuard::lock();
     let scheduler = guard.state();
     assert!(scheduler.threads[0].is_some(), "scheduler not initialized");
-    let id = scheduler
-        .threads
-        .iter()
-        .position(Option::is_none)
-        .expect("scheduler thread slots exhausted");
+    let Some(id) = scheduler.threads.iter().position(Option::is_none) else {
+        drop(guard);
+        drop(stack);
+        return None;
+    };
     scheduler.threads[id] = Some(Thread {
         id,
         name,
         cpu: None,
         pinned_cpu: None,
+        ttbr0,
         state: ThreadState::Ready,
         wake_tick_ms: None,
         context,
         stack: Some(stack),
     });
-    id
+    Some(id)
+}
+
+pub fn spawn(name: &'static str, entry: extern "C" fn() -> !) -> usize {
+    spawn_raw(
+        name,
+        entry as usize as u64,
+        0,
+        crate::mmu::kernel_ttbr0(),
+    )
+    .expect("scheduler thread slots exhausted")
+}
+
+pub fn spawn_with_ttbr0(
+    name: &'static str,
+    entry: extern "C" fn(usize) -> !,
+    arg: usize,
+    ttbr0: u64,
+) -> Option<usize> {
+    spawn_raw(name, entry as usize as u64, arg, ttbr0)
+}
+
+pub fn join(tid: usize) {
+    if tid < MAX_CPUS || tid >= MAX_THREADS {
+        return;
+    }
+    loop {
+        let reaped = {
+            let mut guard = SchedulerGuard::lock();
+            let scheduler = guard.state();
+            match scheduler.threads[tid].as_ref() {
+                None => return,
+                Some(thread) if thread.state == ThreadState::Finished && thread.cpu.is_none() => {
+                    scheduler.threads[tid].take()
+                }
+                Some(_) => None,
+            }
+        };
+        if let Some(thread) = reaped {
+            drop(thread);
+            return;
+        }
+        yield_now();
+    }
 }
 
 pub fn set_trace(enabled: bool) {
@@ -346,6 +420,10 @@ pub fn on_timer_tick() {
     schedule(guard, ThreadState::Ready);
 }
 
+pub fn exit_current() -> ! {
+    scheduler_thread_exit();
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn scheduler_thread_exit() -> ! {
     schedule(SchedulerGuard::lock(), ThreadState::Finished);
@@ -394,9 +472,15 @@ fn schedule(mut guard: SchedulerGuard, previous_state: ThreadState) {
             next.name
         );
     }
+    let prev_ttbr0 = prev.ttbr0;
+    let next_ttbr0 = next.ttbr0;
     let prev_ptr = &raw mut prev.context;
     let next_ptr = &raw const next.context;
     smp::record_ctx_switch();
+    if prev_ttbr0 != next_ttbr0 {
+        // SAFETY: `next_ttbr0` is a valid L1 page table with identity-mapped kernel/MMIO regions.
+        unsafe { crate::mmu::switch_ttbr0(next_ttbr0) };
+    }
     let daif = guard.daif;
     core::mem::forget(guard);
     // SAFETY: The incoming continuation releases the lock only after both stack pointers are switched.
