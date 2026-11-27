@@ -76,7 +76,8 @@ fn execute(line: &str) {
             kprintln!("  blkinfo         Show virtio-blk device slot, MMIO base, and capacity");
             kprintln!("  ls              List files and directories");
             kprintln!("  cat <file>      Show file contents");
-            kprintln!("  exec <file>     Load and run an EL0 ELF64 binary");
+            kprintln!("  exec <file> [&] Load and run an EL0 ELF64 binary (& for background)");
+            kprintln!("  exec-stress [N] Run N concurrent EL0 hello.elf processes (1..=8)");
             kprintln!("  trace <on|off>  Toggle live timer and scheduler trace logging");
             kprintln!("  brk             Trigger a live BRK #0 synchronous trap");
             kprintln!("  clear           Clear the serial terminal");
@@ -89,7 +90,7 @@ fn execute(line: &str) {
             } else {
                 "disabled"
             };
-            kprintln!("Aegis v0.3.0 (aarch64-unknown-none)");
+            kprintln!("Aegis v0.4.0 (aarch64-unknown-none)");
             kprintln!("  CurrentEL  : EL{}", read_current_el());
             kprintln!("  MIDR_EL1   : {:#010x}", read_midr_el1());
             kprintln!("  MMU        : {}", mmu_status);
@@ -218,18 +219,89 @@ fn execute(line: &str) {
             }
         }
         "exec" => {
-            let path = trimmed[cmd.len()..].trim();
+            let raw = trimmed[cmd.len()..].trim();
+            let (path, background) = match raw.strip_suffix('&') {
+                Some(prefix) => (prefix.trim(), true),
+                None => (raw, false),
+            };
             if path.is_empty() {
-                kprintln!("usage: exec <file>");
+                kprintln!("usage: exec <file> [&]");
                 return;
             }
-            match crate::fs::read_file(path) {
-                Ok(bytes) => match crate::user::exec_elf(&bytes) {
-                    Ok(code) => kprintln!("[exec] exited with code {}", code),
+            if background {
+                match crate::user::spawn_elf(path) {
+                    Ok(pid) => kprintln!("[exec] spawned pid={}", pid),
                     Err(error) => kprintln!("exec: {}", error),
-                },
-                Err(error) => kprintln!("exec: {}", error),
+                }
+            } else {
+                match crate::fs::read_file(path) {
+                    Ok(bytes) => match crate::user::exec_elf(&bytes) {
+                        Ok(code) => kprintln!("[exec] exited with code {}", code),
+                        Err(error) => kprintln!("exec: {}", error),
+                    },
+                    Err(error) => kprintln!("exec: {}", error),
+                }
             }
+        }
+        "exec-stress" => {
+            if extra.is_some() {
+                kprintln!("usage: exec-stress [N]");
+                return;
+            }
+            let count = match arg {
+                Some(raw) => match raw.parse::<usize>() {
+                    Ok(n) => n.clamp(1, 8),
+                    Err(_) => {
+                        kprintln!("usage: exec-stress [N]");
+                        return;
+                    }
+                },
+                None => 4,
+            };
+
+            let mut pids = [0usize; 8];
+            let mut spawned = 0usize;
+            let mut err_count = 0usize;
+            for _ in 0..count {
+                match crate::user::spawn_elf("hello.elf") {
+                    Ok(pid) => {
+                        pids[spawned] = pid;
+                        spawned += 1;
+                    }
+                    Err(error) => {
+                        kprintln!("exec-stress: spawn failed: {}", error);
+                        err_count += 1;
+                    }
+                }
+            }
+
+            let mut completed = 0usize;
+            let mut ok_count = 0usize;
+            for &pid in &pids[..spawned] {
+                match crate::user::wait_pid(pid) {
+                    Ok(0) => {
+                        completed += 1;
+                        ok_count += 1;
+                    }
+                    Ok(code) => {
+                        completed += 1;
+                        err_count += 1;
+                        kprintln!("exec-stress: pid={} exited with code {}", pid, code);
+                    }
+                    Err(error) => {
+                        err_count += 1;
+                        kprintln!("exec-stress: wait pid={} failed: {}", pid, error);
+                    }
+                }
+            }
+
+            kprintln!(
+                "[exec-stress] completed {}/{} processes (ok={}, err={})",
+                completed,
+                count,
+                ok_count,
+                err_count
+            );
         }
         "trace" => match (arg, extra) {
             (Some("on"), None) => {
