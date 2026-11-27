@@ -9,9 +9,11 @@ use core::panic::PanicInfo;
 mod allocator;
 pub mod blk;
 mod exceptions;
+pub mod fd;
 pub mod fs;
 mod gic;
 mod mmu;
+pub mod pipe;
 pub mod platform;
 pub mod pmm;
 pub mod sync;
@@ -19,9 +21,38 @@ mod scheduler;
 mod shell;
 pub mod smp;
 mod timer;
-mod uart;
+#[allow(dead_code, reason = "shared UART readers use the wait queue in uart")]
+#[path = "uart.rs"]
+mod uart_driver;
 pub mod user;
 pub mod virtio;
+
+mod uart {
+    use crate::scheduler::WaitQueue;
+    use crate::sync::IrqSpinLock;
+    use crate::uart_driver as driver;
+
+    pub use driver::{_print, init, write_byte};
+
+    static RX_LOCK: IrqSpinLock<()> = IrqSpinLock::new(());
+    static RX_WAITQ: WaitQueue = WaitQueue::new();
+
+    pub fn try_read_byte() -> Option<u8> {
+        let _guard = RX_LOCK.lock();
+        driver::try_read_byte()
+    }
+
+    pub fn wait_for_input() {
+        RX_WAITQ.wait_until(driver::has_pending_input);
+    }
+
+    pub fn handle_irq() {
+        driver::handle_irq();
+        if driver::has_pending_input() {
+            RX_WAITQ.wake_all();
+        }
+    }
+}
 
 global_asm!(include_str!("boot.S"));
 core::arch::global_asm!(include_str!("exceptions.S"));
