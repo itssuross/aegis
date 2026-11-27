@@ -58,6 +58,51 @@ fn read_far_el1() -> u64 {
     far
 }
 
+fn user_ptr_readable(ptr: usize, len: usize) -> bool {
+    const USER_VA_LIMIT: usize = crate::platform::GICD_BASE;
+    let Some(end) = ptr.checked_add(len) else {
+        return false;
+    };
+    if ptr >= USER_VA_LIMIT || end > USER_VA_LIMIT {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+
+    let page_mask = !(crate::platform::PAGE_SIZE - 1);
+    let mut va = ptr & page_mask;
+    let last_page = (end - 1) & page_mask;
+
+    let daif = crate::sync::irq_save_disable();
+    let mut ok = true;
+    loop {
+        let par: u64;
+        // SAFETY: `at s1e0r` queries EL0 stage-1 read translation under the active `TTBR0_EL1`;
+        // IRQs are masked so `PAR_EL1` is not clobbered before being read.
+        unsafe {
+            asm!(
+                "at s1e0r, {va}",
+                "isb",
+                "mrs {par}, par_el1",
+                va = in(reg) va,
+                par = out(reg) par,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        if (par & 1) != 0 {
+            ok = false;
+            break;
+        }
+        if va == last_page {
+            break;
+        }
+        va += crate::platform::PAGE_SIZE;
+    }
+    crate::sync::irq_restore(daif);
+    ok
+}
+
 pub fn init() {
     // SAFETY: `exception_vector_table` is a 2048-byte aligned EL1 vector table defined in `exceptions.S`.
     // Loading its address into `VBAR_EL1` followed by `isb` activates EL1 exception dispatch.
@@ -119,20 +164,16 @@ pub extern "C" fn handle_el0_sync(frame: &mut El0TrapFrame) {
                     frame.regs[0] = EBADF as u64;
                     return;
                 }
-                let user_end = crate::mmu::USER_MEM_BASE + crate::mmu::USER_MEM_SIZE;
-                let Some(end) = ptr.checked_add(len) else {
-                    frame.regs[0] = EFAULT as u64;
-                    return;
-                };
-                if ptr < crate::mmu::USER_MEM_BASE
-                    || end > user_end
-                    || (len == 0 && ptr >= user_end)
-                {
+                if !user_ptr_readable(ptr, len) {
                     frame.regs[0] = EFAULT as u64;
                     return;
                 }
-                // SAFETY: `[ptr, ptr + len)` lies strictly within the single-core EL0 RAM
-                // region (`USER_MEM_BASE..user_end`), which is mapped RW and initialized.
+                if len == 0 {
+                    frame.regs[0] = 0;
+                    return;
+                }
+                // SAFETY: `user_ptr_readable` verified every 4 KiB page in `ptr..ptr + len` is
+                // mapped EL0-readable under the active `TTBR0_EL1`, and `len > 0` implies `ptr != 0`.
                 let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
                 for &byte in bytes {
                     crate::uart::write_byte(byte);
