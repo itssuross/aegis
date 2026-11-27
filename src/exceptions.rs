@@ -3,13 +3,22 @@ use core::arch::{asm, naked_asm};
 const EC_SVC_AARCH64: u64 = 0x15;
 const EC_BRK_AARCH64: u64 = 0x3C;
 
+// AArch64 SVC puts the syscall number in x8 and returns the result in x0.
+const SYS_CLOSE: u64 = 57;
+const SYS_READ: u64 = 63;
 const SYS_WRITE: u64 = 64;
 const SYS_EXIT: u64 = 93;
 const SYS_SCHED_YIELD: u64 = 124;
 const SYS_SLEEP_MS: u64 = 200;
+const SYS_OPEN: u64 = 201;
+const SYS_PIPE: u64 = 202; // x0 points to two u32 descriptors.
+const SYS_SPAWN: u64 = 203;
+const SYS_WAITPID: u64 = 204;
+const SYS_UPTIME_MS: u64 = 205;
 
-const EBADF: i64 = -9;
 const EFAULT: i64 = -14;
+const EINVAL: i64 = -22;
+const ENAMETOOLONG: i64 = -36;
 const ENOSYS: i64 = -38;
 
 #[repr(C)]
@@ -59,6 +68,14 @@ fn read_far_el1() -> u64 {
 }
 
 fn user_ptr_readable(ptr: usize, len: usize) -> bool {
+    user_ptr_accessible::<false>(ptr, len)
+}
+
+fn user_ptr_writable(ptr: usize, len: usize) -> bool {
+    user_ptr_accessible::<true>(ptr, len)
+}
+
+fn user_ptr_accessible<const WRITE: bool>(ptr: usize, len: usize) -> bool {
     const USER_VA_LIMIT: usize = crate::platform::GICD_BASE;
     let Some(end) = ptr.checked_add(len) else {
         return false;
@@ -69,6 +86,9 @@ fn user_ptr_readable(ptr: usize, len: usize) -> bool {
     if len == 0 {
         return true;
     }
+    if ptr == 0 {
+        return false;
+    }
 
     let page_mask = !(crate::platform::PAGE_SIZE - 1);
     let mut va = ptr & page_mask;
@@ -78,17 +98,28 @@ fn user_ptr_readable(ptr: usize, len: usize) -> bool {
     let mut ok = true;
     loop {
         let par: u64;
-        // SAFETY: `at s1e0r` queries EL0 stage-1 read translation under the active `TTBR0_EL1`;
+        // SAFETY: AT queries EL0 stage-1 translation under the active `TTBR0_EL1`.
         // IRQs are masked so `PAR_EL1` is not clobbered before being read.
         unsafe {
-            asm!(
-                "at s1e0r, {va}",
-                "isb",
-                "mrs {par}, par_el1",
-                va = in(reg) va,
-                par = out(reg) par,
-                options(nomem, nostack, preserves_flags),
-            );
+            if WRITE {
+                asm!(
+                    "at s1e0w, {va}",
+                    "isb",
+                    "mrs {par}, par_el1",
+                    va = in(reg) va,
+                    par = out(reg) par,
+                    options(nomem, nostack, preserves_flags),
+                );
+            } else {
+                asm!(
+                    "at s1e0r, {va}",
+                    "isb",
+                    "mrs {par}, par_el1",
+                    va = in(reg) va,
+                    par = out(reg) par,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
         }
         if (par & 1) != 0 {
             ok = false;
@@ -101,6 +132,87 @@ fn user_ptr_readable(ptr: usize, len: usize) -> bool {
     }
     crate::sync::irq_restore(daif);
     ok
+}
+
+fn with_user_path(ptr: usize, len: usize, op: impl FnOnce(&str) -> i64) -> i64 {
+    if len > crate::platform::PAGE_SIZE {
+        return ENAMETOOLONG;
+    }
+    if !user_ptr_readable(ptr, len) {
+        return EFAULT;
+    }
+    let bytes = if len == 0 {
+        &[]
+    } else {
+        // SAFETY: The running process owns the validated readable mapping for the call.
+        unsafe { core::slice::from_raw_parts(ptr as *const u8, len) }
+    };
+    match core::str::from_utf8(bytes) {
+        Ok(path) => op(path),
+        Err(_) => EINVAL,
+    }
+}
+
+fn dispatch_syscall(frame: &El0TrapFrame) -> i64 {
+    let x0 = frame.regs[0] as usize;
+    let x1 = frame.regs[1] as usize;
+    let x2 = frame.regs[2] as usize;
+    match frame.regs[8] {
+        SYS_READ => {
+            let len = x2.min(crate::platform::PAGE_SIZE);
+            if !user_ptr_writable(x1, len) {
+                return EFAULT;
+            }
+            let buf = if len == 0 {
+                &mut []
+            } else {
+                // SAFETY: The validated writable pages are exclusively mapped by this process.
+                // Scheduling restores its TTBR0 before this syscall resumes.
+                unsafe { core::slice::from_raw_parts_mut(x1 as *mut u8, len) }
+            };
+            crate::user::sys_read(x0, buf)
+        }
+        SYS_WRITE => {
+            if !user_ptr_readable(x1, x2) {
+                return EFAULT;
+            }
+            let buf = if x2 == 0 {
+                &[]
+            } else {
+                // SAFETY: The running process owns the validated readable mapping for the call.
+                unsafe { core::slice::from_raw_parts(x1 as *const u8, x2) }
+            };
+            crate::user::sys_write(x0, buf)
+        }
+        SYS_OPEN => with_user_path(x0, x1, crate::user::sys_open),
+        SYS_CLOSE => crate::user::sys_close(x0),
+        SYS_PIPE => {
+            if !user_ptr_writable(x0, size_of::<[u32; 2]>()) {
+                return EFAULT;
+            }
+            match crate::user::sys_pipe() {
+                Ok((read, write)) => {
+                    // SAFETY: The full descriptor pair fits in validated writable user pages.
+                    unsafe { (x0 as *mut [u32; 2]).write_unaligned([read as u32, write as u32]) };
+                    0
+                }
+                Err(errno) => errno,
+            }
+        }
+        SYS_SPAWN => with_user_path(x0, x1, crate::user::sys_spawn),
+        SYS_WAITPID => crate::user::sys_waitpid(x0),
+        SYS_UPTIME_MS => crate::timer::uptime_ms() as i64,
+        SYS_EXIT => crate::user::exit_to_el1(x0 as i32),
+        SYS_SCHED_YIELD => {
+            crate::scheduler::yield_now();
+            0
+        }
+        SYS_SLEEP_MS => {
+            crate::scheduler::sleep_ms(x0 as u64);
+            0
+        }
+        _ => ENOSYS,
+    }
 }
 
 pub fn init() {
@@ -149,52 +261,12 @@ pub extern "C" fn handle_sync_exception(frame: &mut TrapFrame) {
     );
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn handle_el0_sync(frame: &mut El0TrapFrame) {
+extern "C" fn dispatch_el0_sync(frame: &mut El0TrapFrame) {
     let esr = read_esr_el1();
     let ec = (esr >> 26) & 0x3F;
 
     if ec == EC_SVC_AARCH64 {
-        match frame.regs[8] {
-            SYS_WRITE => {
-                let fd = frame.regs[0];
-                let ptr = frame.regs[1] as usize;
-                let len = frame.regs[2] as usize;
-                if fd != 1 && fd != 2 {
-                    frame.regs[0] = EBADF as u64;
-                    return;
-                }
-                if !user_ptr_readable(ptr, len) {
-                    frame.regs[0] = EFAULT as u64;
-                    return;
-                }
-                if len == 0 {
-                    frame.regs[0] = 0;
-                    return;
-                }
-                // SAFETY: `user_ptr_readable` verified every 4 KiB page in `ptr..ptr + len` is
-                // mapped EL0-readable under the active `TTBR0_EL1`, and `len > 0` implies `ptr != 0`.
-                let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
-                for &byte in bytes {
-                    crate::uart::write_byte(byte);
-                }
-                frame.regs[0] = len as u64;
-            }
-            SYS_EXIT => {
-                crate::user::exit_to_el1(frame.regs[0] as i32);
-            }
-            SYS_SCHED_YIELD => {
-                crate::scheduler::yield_now();
-                frame.regs[0] = 0;
-            }
-            SYS_SLEEP_MS => {
-                crate::scheduler::sleep_ms(frame.regs[0]);
-                frame.regs[0] = 0;
-            }
-            _ => {
-                frame.regs[0] = ENOSYS as u64;
-            }
-        }
+        frame.regs[0] = dispatch_syscall(frame) as u64;
         return;
     }
 
@@ -209,10 +281,9 @@ pub extern "C" fn handle_el0_sync(frame: &mut El0TrapFrame) {
     crate::user::exit_to_el1(-1);
 }
 
-#[unsafe(export_name = "handle_irq_exception")]
-#[unsafe(naked)]
-pub extern "C" fn irq_entry(_frame: &mut TrapFrame) {
-    naked_asm!(
+macro_rules! call_preserving_fp {
+    ($dispatch:path) => {
+        naked_asm!(
         "sub sp, sp, #544",
         "stp q0, q1, [sp, #0]",
         "stp q2, q3, [sp, #32]",
@@ -259,8 +330,21 @@ pub extern "C" fn irq_entry(_frame: &mut TrapFrame) {
         "ldp q0, q1, [sp, #0]",
         "add sp, sp, #544",
         "ret",
-        dispatch = sym handle_irq_exception,
-    );
+            dispatch = sym $dispatch,
+        );
+    };
+}
+
+#[unsafe(export_name = "handle_el0_sync")]
+#[unsafe(naked)]
+pub extern "C" fn el0_sync_entry(_frame: &mut El0TrapFrame) {
+    call_preserving_fp!(dispatch_el0_sync);
+}
+
+#[unsafe(export_name = "handle_irq_exception")]
+#[unsafe(naked)]
+pub extern "C" fn irq_entry(_frame: &mut TrapFrame) {
+    call_preserving_fp!(handle_irq_exception);
 }
 
 extern "C" fn handle_irq_exception(_frame: &mut TrapFrame) {
