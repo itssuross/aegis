@@ -71,6 +71,7 @@ fn execute(line: &str) {
             kprintln!("  cpuinfo         Show per-core timer and scheduler counters");
             kprintln!("  uptime          Show uptime in seconds");
             kprintln!("  mem             Show heap bounds and allocated/free bytes");
+            kprintln!("  meminfo         Show 4 KiB physical frame and kernel heap stats");
             kprintln!("  ps              List active kernel threads");
             kprintln!("  blkinfo         Show virtio-blk device slot, MMIO base, and capacity");
             kprintln!("  ls              List files and directories");
@@ -138,6 +139,29 @@ fn execute(line: &str) {
                 heap_end,
                 heap_end - heap_start
             );
+            kprintln!("  allocated : {} bytes", allocated);
+            kprintln!("  free      : {} bytes", free);
+        }
+        "meminfo" => {
+            let pmm = crate::pmm::stats();
+            let free_kib = pmm.free_frames * (crate::platform::PAGE_SIZE / 1024);
+            let free_mib = free_kib / 1024;
+            let (allocated, free) = crate::allocator::stats();
+            kprintln!("pmm:");
+            kprintln!(
+                "  managed   : {:#x}..{:#x}",
+                pmm.managed_start,
+                pmm.managed_end
+            );
+            kprintln!("  total     : {} frames", pmm.total_frames);
+            kprintln!("  used      : {} frames", pmm.used_frames);
+            kprintln!(
+                "  free      : {} frames ({} KiB / {} MiB)",
+                pmm.free_frames,
+                free_kib,
+                free_mib
+            );
+            kprintln!("heap:");
             kprintln!("  allocated : {} bytes", allocated);
             kprintln!("  free      : {} bytes", free);
         }
