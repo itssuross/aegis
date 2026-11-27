@@ -1,17 +1,15 @@
 use core::arch::asm;
 
-pub const USER_MEM_BASE: usize = 0x4200_0000;
-pub const USER_MEM_SIZE: usize = 0x0020_0000;
-
 const ENTRIES_PER_TABLE: usize = 512;
 const TABLE_INDEX_MASK: usize = ENTRIES_PER_TABLE - 1;
 const VA_SPACE_SIZE: usize = 1 << 39; // 39-bit VA (T0SZ = 25)
 const L1_BLOCK_SIZE: u64 = 1 << 30;
-const L2_BLOCK_SIZE: u64 = 1 << 21;
-const USER_L2_INDEX: usize = (USER_MEM_BASE - L1_BLOCK_SIZE as usize) / USER_MEM_SIZE;
+const L2_BLOCK_SIZE: usize = 1 << 21;
 
-const _: () = assert!(USER_L2_INDEX == 16);
-const _: () = assert!(USER_MEM_SIZE as u64 == L2_BLOCK_SIZE);
+const KERNEL_MMIO_START: usize = 0x0800_0000;
+const KERNEL_MMIO_END: usize = 0x0B00_0000;
+const KERNEL_RAM_START: usize = crate::platform::RAM_BASE;
+const KERNEL_RAM_END: usize = crate::platform::RAM_END;
 
 const DESC_TYPE_MASK: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
@@ -27,6 +25,7 @@ const AP_EL0_RO: u64 = 0b11 << 6;
 const SH_NON: u64 = 0b00 << 8;
 const SH_INNER: u64 = 0b11 << 8;
 const AF: u64 = 1 << 10;
+const NG: u64 = 1 << 11; // non-global, ASID-tagged TLB entry
 pub const PXN: u64 = 1 << 53;
 pub const UXN: u64 = 1 << 54;
 
@@ -40,6 +39,7 @@ const TCR_TG0_4K: u64 = 0b00 << 14;
 const TCR_EPD1: u64 = 1 << 23;
 const TCR_TG1_4K: u64 = 0b10 << 30; // non-reserved TG1 encoding
 const TCR_IPS_40BIT: u64 = 0b010 << 32;
+const TCR_AS: u64 = 1 << 36; // 16-bit ASID in TTBR0_EL1[63:48] (A1 = 0)
 
 const TCR_VALUE: u64 = TCR_T0SZ
     | TCR_IRGN0_WBWA
@@ -48,7 +48,8 @@ const TCR_VALUE: u64 = TCR_T0SZ
     | TCR_TG0_4K
     | TCR_EPD1
     | TCR_TG1_4K
-    | TCR_IPS_40BIT;
+    | TCR_IPS_40BIT
+    | TCR_AS;
 
 const SCTLR_M: u64 = 1 << 0;
 const SCTLR_C: u64 = 1 << 2;
@@ -60,10 +61,6 @@ struct RawPageTable {
 }
 
 static mut L1_TABLE: RawPageTable = RawPageTable {
-    entries: [0; ENTRIES_PER_TABLE],
-};
-
-static mut L2_RAM_TABLE: RawPageTable = RawPageTable {
     entries: [0; ENTRIES_PER_TABLE],
 };
 
@@ -90,12 +87,12 @@ impl PageFlags {
             }
             Self::KernelRx => DESC_PAGE | ATTR_INDX_NORMAL | AP_EL1_RO | SH_INNER | AF | UXN,
             Self::UserRo => {
-                DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RO | SH_INNER | AF | PXN | UXN
+                DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RO | SH_INNER | AF | NG | PXN | UXN
             }
             Self::UserRw => {
-                DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RW | SH_INNER | AF | PXN | UXN
+                DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RW | SH_INNER | AF | NG | PXN | UXN
             }
-            Self::UserRx => DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RO | SH_INNER | AF | PXN,
+            Self::UserRx => DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RO | SH_INNER | AF | NG | PXN,
             Self::Device => DESC_PAGE | ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN,
         }
     }
@@ -135,7 +132,6 @@ impl PageTable {
         Some(Self { root_phys })
     }
 
-    #[allow(dead_code)]
     pub fn root_phys(&self) -> usize {
         self.root_phys
     }
@@ -157,6 +153,45 @@ impl PageTable {
             DESC_TABLE => Ok((entry & ADDR_MASK) as usize),
             _ => Err("mmu: conflicting block descriptor"),
         }
+    }
+
+    fn map_l2_blocks(
+        &mut self,
+        start: usize,
+        end: usize,
+        attrs: u64,
+    ) -> Result<(), &'static str> {
+        let mut addr = start;
+        while addr < end {
+            let (l1_idx, l2_idx, _) = table_indices(addr);
+            // SAFETY: `&mut self` grants exclusive access to `root_phys` and its L2 tables.
+            let l2_phys = unsafe { Self::ensure_next_table(self.root_phys, l1_idx)? };
+            // SAFETY: `l2_phys` is an owned L2 table frame and `l2_idx < ENTRIES_PER_TABLE`.
+            let existing = unsafe { read_entry(l2_phys, l2_idx) };
+            if (existing & DESC_TYPE_MASK) != 0 {
+                return Err("mmu: L2 entry already mapped");
+            }
+            // SAFETY: `l2_phys` is owned exclusively by `&mut self` and `l2_idx < ENTRIES_PER_TABLE`.
+            unsafe {
+                write_entry(l2_phys, l2_idx, (addr as u64) | DESC_BLOCK | attrs);
+            }
+            addr += L2_BLOCK_SIZE;
+        }
+        Ok(())
+    }
+
+    pub fn map_kernel_regions(&mut self) -> Result<(), &'static str> {
+        self.map_l2_blocks(
+            KERNEL_MMIO_START,
+            KERNEL_MMIO_END,
+            ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN,
+        )?;
+        self.map_l2_blocks(
+            KERNEL_RAM_START,
+            KERNEL_RAM_END,
+            ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN,
+        )?;
+        Ok(())
     }
 
     pub fn map_4k(
@@ -282,13 +317,45 @@ impl Drop for PageTable {
     }
 }
 
+pub fn kernel_ttbr0() -> u64 {
+    &raw const L1_TABLE as usize as u64
+}
+
+// SAFETY: Caller guarantees `ttbr0` holds a valid 4 KiB-aligned L1 page table that identity-maps
+// active kernel text, stacks, data, and MMIO, with a valid 16-bit ASID in bits [63:48].
+pub unsafe fn switch_ttbr0(ttbr0: u64) {
+    // SAFETY: Writing `TTBR0_EL1` followed by `isb` activates the target translation table and ASID.
+    unsafe {
+        asm!(
+            "msr ttbr0_el1, {ttbr0}",
+            "isb",
+            ttbr0 = in(reg) ttbr0,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
+pub fn flush_asid(asid: u16) {
+    let operand = (asid as u64) << 48; // ASID[63:48]
+    // SAFETY: `tlbi aside1is` invalidates non-global EL1/EL0 TLB entries for `asid` across all cores.
+    unsafe {
+        asm!(
+            "dsb ishst",
+            "tlbi aside1is, {asid}",
+            "dsb ish",
+            "isb",
+            asid = in(reg) operand,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 unsafe fn enable_mmu_on_current_cpu() {
-    let ttbr0 = &raw const L1_TABLE as u64;
+    let ttbr0 = kernel_ttbr0();
     let sctlr_flags = SCTLR_M | SCTLR_C | SCTLR_I;
 
-    // SAFETY: Caller guarantees `L1_TABLE` and `L2_RAM_TABLE` are initialized and identity-map all
-    // memory the kernel touches (code, data, stack, heap, and MMIO), so execution continues
-    // seamlessly once SCTLR_EL1.M is set.
+    // SAFETY: Caller guarantees `L1_TABLE` is initialized and identity-maps all memory the kernel
+    // touches (code, data, stack, heap, and MMIO), so execution continues once `SCTLR_EL1.M` is set.
     unsafe {
         asm!(
             "msr mair_el1, {mair}",
@@ -315,24 +382,14 @@ unsafe fn enable_mmu_on_current_cpu() {
 
 pub fn init() {
     // SAFETY: Called once on the single boot core with the MMU disabled; no other references
-    // to `L1_TABLE` or `L2_RAM_TABLE` exist while they are populated.
-    let (l1_table, l2_table) =
-        unsafe { (&mut *(&raw mut L1_TABLE), &mut *(&raw mut L2_RAM_TABLE)) };
+    // to `L1_TABLE` exist while it is populated.
+    let l1_table = unsafe { &mut *(&raw mut L1_TABLE) };
 
-    for (index, entry) in l2_table.entries.iter_mut().enumerate() {
-        let block_pa = L1_BLOCK_SIZE + (index as u64) * L2_BLOCK_SIZE;
-        *entry = if index == USER_L2_INDEX {
-            block_pa | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL0_RW | SH_INNER | AF | PXN
-        } else {
-            block_pa | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN
-        };
-    }
+    l1_table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN;
+    l1_table.entries[1] =
+        L1_BLOCK_SIZE | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN;
 
-    l1_table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AF | PXN | UXN;
-    l1_table.entries[1] = (&raw const L2_RAM_TABLE as u64) | DESC_TABLE;
-
-    // SAFETY: `L1_TABLE` and `L2_RAM_TABLE` were just populated with identity mappings for all
-    // kernel memory and MMIO.
+    // SAFETY: `L1_TABLE` was just populated with EL1-only identity mappings for kernel RAM and MMIO.
     unsafe {
         enable_mmu_on_current_cpu();
     }
@@ -341,7 +398,7 @@ pub fn init() {
 // SAFETY: Core 0 must have completed `mmu::init()` before any secondary core calls this, and the
 // caller must execute at EL1 with the MMU disabled.
 pub unsafe fn init_secondary() {
-    // SAFETY: Caller guarantees `L1_TABLE` and `L2_RAM_TABLE` are already initialized and immutable.
+    // SAFETY: Caller guarantees `L1_TABLE` is already initialized and immutable.
     unsafe {
         enable_mmu_on_current_cpu();
     }
