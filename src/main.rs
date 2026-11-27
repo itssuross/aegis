@@ -12,6 +12,8 @@ mod exceptions;
 pub mod fs;
 mod gic;
 mod mmu;
+pub mod platform;
+pub mod pmm;
 pub mod sync;
 mod scheduler;
 mod shell;
@@ -41,6 +43,47 @@ fn current_el() -> u64 {
     (el >> 2) & 0b11
 }
 
+fn verify_page_table_lifecycle() {
+    const TEST_RX_VA: usize = 0x0040_0000;
+    const TEST_RW_VA: usize = 0x0040_1000;
+
+    let before = pmm::stats().used_frames;
+    {
+        let mut pt = mmu::PageTable::new().expect("failed to allocate L1 page table");
+        assert_eq!(pt.root_phys() & (platform::PAGE_SIZE - 1), 0);
+
+        let rx_phys = pmm::alloc_frame().expect("failed to allocate UserRx frame");
+        let rw_phys = pmm::alloc_frame().expect("failed to allocate UserRw frame");
+
+        pt.map_4k(TEST_RX_VA, rx_phys, mmu::PageFlags::UserRx)
+            .expect("failed to map UserRx page");
+        pt.map_4k(TEST_RW_VA, rw_phys, mmu::PageFlags::UserRw)
+            .expect("failed to map UserRw page");
+
+        let (tr_rx, pte_rx) = pt.translate(TEST_RX_VA).expect("missing UserRx mapping");
+        assert_eq!(tr_rx, rx_phys);
+        assert_eq!(pte_rx & mmu::UXN, 0, "UserRx page must clear UXN");
+
+        let (tr_rw, pte_rw) = pt.translate(TEST_RW_VA).expect("missing UserRw mapping");
+        assert_eq!(tr_rw, rw_phys);
+        assert_ne!(pte_rw & mmu::UXN, 0, "UserRw page must set UXN");
+
+        assert_eq!(pt.unmap_4k(TEST_RX_VA), Some(rx_phys));
+        assert_eq!(pt.unmap_4k(TEST_RW_VA), Some(rw_phys));
+        assert!(pt.translate(TEST_RX_VA).is_none());
+        assert!(pt.translate(TEST_RW_VA).is_none());
+
+        pmm::free_frame(rx_phys);
+        pmm::free_frame(rw_phys);
+    }
+    assert_eq!(
+        pmm::stats().used_frames,
+        before,
+        "page table lifecycle leaked physical frames"
+    );
+    kprintln!("[mmu] 3-level 4 KiB page table self-test passed (0 frames leaked)");
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain() -> ! {
     uart::init();
@@ -61,6 +104,17 @@ pub extern "C" fn kmain() -> ! {
     unsafe {
         allocator::init(heap_start, heap_end - heap_start);
     }
+
+    pmm::init();
+    let pmm_stats = pmm::stats();
+    kprintln!(
+        "[pmm] managed {:#x}..{:#x} ({} frames, {} MiB free)",
+        pmm_stats.managed_start,
+        pmm_stats.managed_end,
+        pmm_stats.total_frames,
+        (pmm_stats.free_frames * platform::PAGE_SIZE) / (1024 * 1024)
+    );
+    verify_page_table_lifecycle();
 
     gic::init();
     scheduler::init();
