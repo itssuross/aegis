@@ -36,14 +36,18 @@ cargo run < "$fifo" > "$log" 2>&1 &
 qemu_pid=$!
 
 (
-    ticks=0
-    while [ "$ticks" -lt 150 ]; do
-        if grep -Fq "aegis> " "$log" 2>/dev/null; then
-            break
-        fi
-        sleep 0.1
-        ticks=$((ticks + 1))
-    done
+    wait_for_log() {
+        ticks=0
+        while [ "$ticks" -lt 150 ]; do
+            if grep -Fq "$1" "$log" 2>/dev/null; then
+                break
+            fi
+            sleep 0.1
+            ticks=$((ticks + 1))
+        done
+    }
+
+    wait_for_log "aegis> "
 
     for cmd in \
         "info" \
@@ -53,7 +57,19 @@ qemu_pid=$!
         "blkinfo" \
         "ls" \
         "cat motd.txt" \
-        "exec hello.elf" \
+        "exec hello.elf"
+    do
+        printf '%s\n' "$cmd"
+        sleep 0.15
+    done
+
+    wait_for_log "[exec] exited with code 0"
+    printf 'exec-stress 4\n'
+    wait_for_log "[exec-stress] completed 4/4 processes (ok=4, err=0)"
+
+    for cmd in \
+        "meminfo" \
+        "exec missing.elf" \
         "halt"
     do
         printf '%s\n' "$cmd"
@@ -106,6 +122,14 @@ assert_contains "managed   :"
 assert_contains "online: 4/4"
 assert_contains "Welcome to Aegis"
 assert_contains "[exec] exited with code 0"
+assert_contains "[exec-stress] completed 4/4 processes (ok=4, err=0)"
+post_stress=$(awk '/\[exec-stress\] completed 4\/4 processes \(ok=4, err=0\)/ { found = 1 } found' "$log")
+if ! printf '%s\n' "$post_stress" | grep -Eq 'used[[:space:]]*:[[:space:]]*0 frames'; then
+    echo "FAIL: expected 0 used PMM frames after exec-stress 4" >&2
+    cat "$log" >&2
+    exit 1
+fi
+assert_contains "exec: fs: file not found"
 assert_contains "Halting via PSCI..."
 
 echo "PASS: QEMU SMP, PMM, and EL0 regression checks succeeded"
