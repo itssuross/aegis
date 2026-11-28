@@ -225,6 +225,10 @@ pub extern "C" fn kmain() -> ! {
                 sectors / 2
             );
         }
+        match fs::init() {
+            Ok(()) => kprintln!("[fs] mounted AegisFS"),
+            Err(error) => kprintln!("[fs] mount failed: {}", error),
+        }
     } else {
         kprintln!("[blk] no virtio-blk device found");
     }
