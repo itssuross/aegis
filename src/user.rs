@@ -5,7 +5,7 @@ use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use crate::fd::{EBADF, FdKind, FdTable};
 use crate::mmu::{PageFlags, PageTable};
 use crate::pipe::{self, PipeHandle};
-use crate::platform::PAGE_SIZE;
+use crate::platform::{PAGE_SIZE, phys_to_virt};
 use crate::scheduler::WaitQueue;
 use crate::sync::IrqSpinLock;
 
@@ -532,11 +532,11 @@ fn load_elf_image(image: &[u8]) -> Result<(UserAddressSpace, usize), &'static st
                 let src_off = p_offset + (copy_lo - p_vaddr);
                 let copy_len = copy_hi - copy_lo;
                 // SAFETY: `src_off..src_off + copy_len` was bounds-checked against `image`, and
-                // `phys + dst_off..phys + dst_off + copy_len` lies within our exclusively owned 4 KiB frame.
+                // the destination lies within the direct map of our exclusively owned 4 KiB frame.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         image.as_ptr().add(src_off),
-                        (phys + dst_off) as *mut u8,
+                        (phys_to_virt(phys) + dst_off) as *mut u8,
                         copy_len,
                     );
                 }
@@ -559,9 +559,10 @@ fn load_elf_image(image: &[u8]) -> Result<(UserAddressSpace, usize), &'static st
             PageFlags::UserRo
         };
         if flags == PageFlags::UserRx {
-            let mut line = phys;
-            while line < phys + PAGE_SIZE {
-                // SAFETY: `line` is a 64-byte aligned address in an owned identity-mapped RAM frame.
+            let page_virt = phys_to_virt(phys);
+            let mut line = page_virt;
+            while line < page_virt + PAGE_SIZE {
+                // SAFETY: `line` is a 64-byte aligned address in the direct map of an owned frame.
                 unsafe {
                     asm!("dc cvau, {}", in(reg) line, options(nostack, preserves_flags));
                 }
