@@ -1,5 +1,7 @@
 use core::arch::asm;
 
+use crate::platform::{phys_to_virt, virt_to_phys};
+
 const ENTRIES_PER_TABLE: usize = 512;
 const TABLE_INDEX_MASK: usize = ENTRIES_PER_TABLE - 1;
 const VA_SPACE_SIZE: usize = 1 << 39; // 39-bit VA (T0SZ = 25)
@@ -36,8 +38,11 @@ const TCR_IRGN0_WBWA: u64 = 0b01 << 8;
 const TCR_ORGN0_WBWA: u64 = 0b01 << 10;
 const TCR_SH0_INNER: u64 = 0b11 << 12;
 const TCR_TG0_4K: u64 = 0b00 << 14;
-const TCR_EPD1: u64 = 1 << 23;
-const TCR_TG1_4K: u64 = 0b10 << 30; // non-reserved TG1 encoding
+const TCR_T1SZ: u64 = 25 << 16;
+const TCR_IRGN1_WBWA: u64 = 0b01 << 24;
+const TCR_ORGN1_WBWA: u64 = 0b01 << 26;
+const TCR_SH1_INNER: u64 = 0b11 << 28;
+const TCR_TG1_4K: u64 = 0b10 << 30;
 const TCR_IPS_40BIT: u64 = 0b010 << 32;
 const TCR_AS: u64 = 1 << 36; // 16-bit ASID in TTBR0_EL1[63:48] (A1 = 0)
 
@@ -46,7 +51,10 @@ const TCR_VALUE: u64 = TCR_T0SZ
     | TCR_ORGN0_WBWA
     | TCR_SH0_INNER
     | TCR_TG0_4K
-    | TCR_EPD1
+    | TCR_T1SZ
+    | TCR_IRGN1_WBWA
+    | TCR_ORGN1_WBWA
+    | TCR_SH1_INNER
     | TCR_TG1_4K
     | TCR_IPS_40BIT
     | TCR_AS;
@@ -60,7 +68,15 @@ struct RawPageTable {
     entries: [u64; ENTRIES_PER_TABLE],
 }
 
-static mut L1_TABLE: RawPageTable = RawPageTable {
+static mut KERNEL_TTBR1_L1: RawPageTable = RawPageTable {
+    entries: [0; ENTRIES_PER_TABLE],
+};
+
+static mut BOOT_TTBR0_L1: RawPageTable = RawPageTable {
+    entries: [0; ENTRIES_PER_TABLE],
+};
+
+static EMPTY_TTBR0_L1: RawPageTable = RawPageTable {
     entries: [0; ENTRIES_PER_TABLE],
 };
 
@@ -106,20 +122,20 @@ const fn table_indices(virt: usize) -> (usize, usize, usize) {
     (l1, l2, l3)
 }
 
-// SAFETY: `table_phys` must be a valid 4 KiB-aligned table frame in identity-mapped RAM
+// SAFETY: `table_phys` must be a valid 4 KiB-aligned table frame in direct-mapped RAM
 // and `index < ENTRIES_PER_TABLE`.
 #[inline]
 unsafe fn read_entry(table_phys: usize, index: usize) -> u64 {
     // SAFETY: Caller guarantees `table_phys` points to a live 512-entry u64 table and `index < 512`.
-    unsafe { (table_phys as *const u64).add(index).read() }
+    unsafe { (phys_to_virt(table_phys) as *const u64).add(index).read() }
 }
 
 // SAFETY: `table_phys` must be a valid, exclusively-accessed 4 KiB-aligned table frame
-// in identity-mapped RAM and `index < ENTRIES_PER_TABLE`.
+// in direct-mapped RAM and `index < ENTRIES_PER_TABLE`.
 #[inline]
 unsafe fn write_entry(table_phys: usize, index: usize, value: u64) {
     // SAFETY: Caller guarantees exclusive access to the live 512-entry u64 table and `index < 512`.
-    unsafe { (table_phys as *mut u64).add(index).write(value) }
+    unsafe { (phys_to_virt(table_phys) as *mut u64).add(index).write(value) }
 }
 
 pub struct PageTable {
@@ -136,7 +152,7 @@ impl PageTable {
         self.root_phys
     }
 
-    // SAFETY: `table_phys` must be an owned 4 KiB-aligned L1 or L2 table frame in identity-mapped RAM.
+    // SAFETY: `table_phys` must be an owned 4 KiB-aligned L1 or L2 table frame in direct-mapped RAM.
     unsafe fn ensure_next_table(table_phys: usize, index: usize) -> Result<usize, &'static str> {
         // SAFETY: Caller owns `table_phys` exclusively and `index < ENTRIES_PER_TABLE`.
         let entry = unsafe { read_entry(table_phys, index) };
@@ -318,11 +334,10 @@ impl Drop for PageTable {
 }
 
 pub fn kernel_ttbr0() -> u64 {
-    &raw const L1_TABLE as usize as u64
+    virt_to_phys(&raw const EMPTY_TTBR0_L1 as usize) as u64
 }
 
-// SAFETY: Caller guarantees `ttbr0` holds a valid 4 KiB-aligned L1 page table that identity-maps
-// active kernel text, stacks, data, and MMIO, with a valid 16-bit ASID in bits [63:48].
+// SAFETY: `ttbr0` holds the physical base of a live, 4 KiB-aligned L1 table and an ASID in bits [63:48].
 pub unsafe fn switch_ttbr0(ttbr0: u64) {
     // SAFETY: Writing `TTBR0_EL1` followed by `isb` activates the target translation table and ASID.
     unsafe {
@@ -350,18 +365,53 @@ pub fn flush_asid(asid: u16) {
     }
 }
 
-unsafe fn enable_mmu_on_current_cpu() {
-    let ttbr0 = kernel_ttbr0();
-    let sctlr_flags = SCTLR_M | SCTLR_C | SCTLR_I;
+// SAFETY: Call from the physical EL1 boot trampoline with the MMU off. Core 0 owns
+// the zeroed boot tables until it publishes them and starts the secondary cores.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn boot_enable_higher_half_mmu() {
+    let ttbr0: usize;
+    let ttbr1: usize;
+    let mpidr: u64;
 
-    // SAFETY: Caller guarantees `L1_TABLE` is initialized and identity-maps all memory the kernel
-    // touches (code, data, stack, heap, and MMIO), so execution continues once `SCTLR_EL1.M` is set.
+    // SAFETY: The physical PC and the linked VMA differ by the same offset as both tables.
     unsafe {
         asm!(
+            "adrp {ttbr0}, {boot_table}",
+            "add {ttbr0}, {ttbr0}, :lo12:{boot_table}",
+            "adrp {ttbr1}, {kernel_table}",
+            "add {ttbr1}, {ttbr1}, :lo12:{kernel_table}",
+            "mrs {mpidr}, mpidr_el1",
+            ttbr0 = out(reg) ttbr0,
+            ttbr1 = out(reg) ttbr1,
+            mpidr = out(reg) mpidr,
+            boot_table = sym BOOT_TTBR0_L1,
+            kernel_table = sym KERNEL_TTBR1_L1,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+
+    if mpidr & 0xff == 0 {
+        let ram = L1_BLOCK_SIZE | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN;
+        let device = DESC_BLOCK | ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN;
+        let boot_table = ttbr0 as *mut u64;
+        let kernel_table = ttbr1 as *mut u64;
+        // SAFETY: Core 0 exclusively owns both 512-entry tables before enabling translation.
+        unsafe {
+            boot_table.add(1).write_volatile(ram);
+            kernel_table.write_volatile(device);
+            kernel_table.add(1).write_volatile(ram);
+        }
+    }
+
+    // SAFETY: TTBR0 maps the executing physical trampoline and stack, and TTBR1 maps their
+    // higher-half aliases. The barrier publishes the descriptors before enabling translation.
+    unsafe {
+        asm!(
+            "dsb sy",
             "msr mair_el1, {mair}",
             "msr tcr_el1, {tcr}",
             "msr ttbr0_el1, {ttbr0}",
-            "dsb ish",
+            "msr ttbr1_el1, {ttbr1}",
             "isb",
             "tlbi vmalle1",
             "dsb ish",
@@ -373,7 +423,8 @@ unsafe fn enable_mmu_on_current_cpu() {
             mair = in(reg) MAIR_VALUE,
             tcr = in(reg) TCR_VALUE,
             ttbr0 = in(reg) ttbr0,
-            flags = in(reg) sctlr_flags,
+            ttbr1 = in(reg) ttbr1,
+            flags = in(reg) SCTLR_M | SCTLR_C | SCTLR_I,
             tmp = out(reg) _,
             options(nostack, preserves_flags),
         );
@@ -381,26 +432,28 @@ unsafe fn enable_mmu_on_current_cpu() {
 }
 
 pub fn init() {
-    // SAFETY: Called once on the single boot core with the MMU disabled; no other references
-    // to `L1_TABLE` exist while it is populated.
-    let l1_table = unsafe { &mut *(&raw mut L1_TABLE) };
+    assert!(is_enabled(), "MMU failed to enable");
+}
 
-    l1_table.entries[0] = DESC_BLOCK | ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN;
-    l1_table.entries[1] =
-        L1_BLOCK_SIZE | DESC_BLOCK | ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN;
-
-    // SAFETY: `L1_TABLE` was just populated with EL1-only identity mappings for kernel RAM and MMIO.
+// SAFETY: This core must be executing at EL1 with its PC, stack, and vectors mapped by TTBR1.
+pub unsafe fn drop_boot_identity_map() {
+    // SAFETY: The empty L1 table is static, aligned, and used with ASID 0.
     unsafe {
-        enable_mmu_on_current_cpu();
+        switch_ttbr0(kernel_ttbr0());
+        asm!(
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack, preserves_flags),
+        );
     }
 }
 
-// SAFETY: Core 0 must have completed `mmu::init()` before any secondary core calls this, and the
-// caller must execute at EL1 with the MMU disabled.
+// SAFETY: The secondary core must have entered the higher half with its stack and vectors.
 pub unsafe fn init_secondary() {
-    // SAFETY: Caller guarantees `L1_TABLE` is already initialized and immutable.
+    // SAFETY: The trampoline has moved all live addresses on this core to TTBR1.
     unsafe {
-        enable_mmu_on_current_cpu();
+        drop_boot_identity_map();
     }
 }
 
