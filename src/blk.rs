@@ -20,7 +20,6 @@ const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 pub const SECTOR_SIZE: usize = 512;
 
 #[repr(C)]
-#[allow(dead_code)]
 struct BlkReqHeader {
     req_type: u32,
     reserved: u32,
@@ -70,7 +69,6 @@ pub fn info() -> Option<(usize, usize, u64)> {
     Some((dev.slot, dev.mmio_base, dev.capacity_sectors))
 }
 
-#[allow(dead_code)]
 fn do_request(
     req_type: u32,
     sector: u64,
@@ -124,7 +122,6 @@ fn do_request(
     }
 }
 
-#[allow(dead_code)]
 pub fn read_sector(sector: u64, buf: &mut [u8; 512]) -> Result<(), &'static str> {
     do_request(
         VIRTIO_BLK_T_IN,
@@ -134,7 +131,6 @@ pub fn read_sector(sector: u64, buf: &mut [u8; 512]) -> Result<(), &'static str>
     )
 }
 
-#[allow(dead_code)]
-pub fn write_sector(sector: u64, buf: &[u8; 512]) -> Result<(), &'static str> {
-    do_request(VIRTIO_BLK_T_OUT, sector, buf.as_ptr() as usize, 0)
+pub fn write_sector(sector: usize, buf: &[u8; 512]) -> Result<(), &'static str> {
+    do_request(VIRTIO_BLK_T_OUT, sector as u64, buf.as_ptr() as usize, 0)
 }
