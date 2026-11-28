@@ -765,9 +765,8 @@ pub fn sys_read(fd: usize, buf: &mut [u8]) -> i64 {
             }
             Ok(count)
         }
-        Some(FdKind::UstarFile { bytes, offset }) => {
-            let count = buf.len().min(bytes.len() - *offset);
-            buf[..count].copy_from_slice(&bytes[*offset..*offset + count]);
+        Some(FdKind::AegisFile { meta, offset }) => {
+            let count = crate::fs::read_at(meta, *offset, buf).map_err(file_errno)?;
             *offset += count;
             Ok(count)
         }
@@ -804,8 +803,9 @@ pub fn sys_open(path: &str) -> i64 {
         if !fds.has_capacity(1) {
             return Err(EMFILE);
         }
-        let bytes = crate::fs::read_file(path).map_err(file_errno)?;
-        fds.alloc(FdKind::UstarFile { bytes, offset: 0 })
+        let path = path.strip_prefix("./").unwrap_or(path);
+        let meta = crate::fs::find(path).ok_or(ENOENT)?;
+        fds.alloc(FdKind::AegisFile { meta, offset: 0 })
             .ok_or(EMFILE)
     })
     .map_or_else(|errno| errno, |fd| fd as i64)
