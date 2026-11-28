@@ -134,6 +134,8 @@ assert_contains() {
 }
 
 assert_contains "active cores: 4/4"
+assert_contains "Aegis v0.6.0 (aarch64-unknown-none)"
+assert_contains "KernelVMA  : 0xFFFF_FF80_4008_0000 (TTBR1_EL1)"
 assert_contains "[pmm]"
 assert_contains "0 frames leaked"
 assert_contains "managed   :"
@@ -183,14 +185,19 @@ post_shell_meminfo=$(awk '
     /^Aegis EL0 shell/ { saw_shell = 1 }
     saw_shell && /^\[exec\] exited with code 0/ { exited = 1 }
     exited && /^aegis> meminfo/ { in_meminfo = 1; next }
-    in_meminfo && /^aegis> / { exit }
     in_meminfo { sub(/\r$/, ""); print }
+    in_meminfo && /^aegis> / { exit }
 ' "$log")
 if ! printf '%s\n' "$post_shell_meminfo" | grep -Eq '^ *used *: *0 frames$'; then
     echo "FAIL: expected 0 used PMM frames after exec sh.elf" >&2
     cat "$log" >&2
     exit 1
 fi
+if ! printf '%s\n' "$post_shell_meminfo" | grep -Fxq 'aegis> halt'; then
+    echo "FAIL: expected halt immediately after final meminfo" >&2
+    cat "$log" >&2
+    exit 1
+fi
 assert_contains "Halting via PSCI..."
 
-echo "PASS: QEMU SMP, PMM, and EL0 regression checks succeeded"
+echo "PASS: QEMU v0.6.0 higher-half, SMP, PMM, and EL0 regression checks succeeded"
