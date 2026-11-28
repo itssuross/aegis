@@ -1,6 +1,7 @@
 use core::arch::asm;
 use core::sync::atomic::Ordering;
 
+use crate::fs;
 use crate::{kprint, kprintln};
 
 const LINE_BUF_LEN: usize = 128;
@@ -75,8 +76,13 @@ fn execute(line: &str) {
             kprintln!("  meminfo         Show 4 KiB physical frame and kernel heap stats");
             kprintln!("  ps              List active kernel threads");
             kprintln!("  blkinfo         Show virtio-blk device slot, MMIO base, and capacity");
-            kprintln!("  ls              List files and directories");
+            kprintln!("  fsinfo          Show AegisFS sector and file counts");
+            kprintln!("  ls              List files");
             kprintln!("  cat <file>      Show file contents");
+            kprintln!("  touch <file>    Create an empty file if missing");
+            kprintln!("  write <file> <text>  Create or replace a file");
+            kprintln!("  append <file> <text> Add text to a file");
+            kprintln!("  rm <file>       Remove a file");
             kprintln!("  exec <file> [&] Load and run an EL0 ELF64 binary (& for background)");
             kprintln!("  exec-stress [N] Run N concurrent EL0 hello.elf processes (1..=8)");
             kprintln!("  trace <on|off>  Toggle live timer and scheduler trace logging");
@@ -194,12 +200,60 @@ fn execute(line: &str) {
                 kprintln!("blkinfo: no virtio-blk device attached");
             }
         },
+        "fsinfo" => {
+            if arg.is_some() {
+                kprintln!("usage: fsinfo");
+                return;
+            }
+            let stats = fs::stats();
+            if stats.total_sectors == 0 {
+                kprintln!("fsinfo: AegisFS not mounted");
+                return;
+            }
+            kprintln!(
+                "AegisFS: {} sectors ({} used, {} free), {}/{} files",
+                stats.total_sectors,
+                stats.used_sectors,
+                stats.free_sectors,
+                stats.active_files,
+                stats.max_files
+            );
+        }
         "ls" => {
-            if let Err(error) = crate::fs::list_entries(|entry| {
-                let kind = if entry.is_dir { "DIR " } else { "FILE" };
-                kprintln!("{} {:>8} {}", kind, entry.size, entry.name());
-            }) {
-                kprintln!("ls: {}", error);
+            if fs::stats().total_sectors == 0 {
+                kprintln!("ls: AegisFS not mounted");
+                return;
+            }
+            fs::list(|name, size| kprintln!("FILE {:>8} {}", size, name));
+        }
+        "touch" | "rm" => {
+            let (Some(name), None) = (arg, extra) else {
+                kprintln!("usage: {} <file>", cmd);
+                return;
+            };
+            let result = if cmd == "touch" {
+                fs::append_file(name, &[])
+            } else {
+                fs::remove_file(name)
+            };
+            if let Err(error) = result {
+                kprintln!("{}: {}", cmd, error);
+            }
+        }
+        "write" | "append" => {
+            let (Some(name), Some(_)) = (arg, extra) else {
+                kprintln!("usage: {} <file> <text>", cmd);
+                return;
+            };
+            let args = trimmed[cmd.len()..].trim_start();
+            let text = args[name.len()..].trim_start().as_bytes();
+            let result = if cmd == "write" {
+                fs::write_file(name, text)
+            } else {
+                fs::append_file(name, text)
+            };
+            if let Err(error) = result {
+                kprintln!("{}: {}", cmd, error);
             }
         }
         "cat" => {
@@ -208,7 +262,7 @@ fn execute(line: &str) {
                 kprintln!("usage: cat <file>");
                 return;
             }
-            match crate::fs::read_file(path) {
+            match fs::read_file(path) {
                 Ok(bytes) => {
                     for chunk in bytes.utf8_chunks() {
                         for ch in chunk.valid().chars() {
@@ -243,7 +297,7 @@ fn execute(line: &str) {
                     Err(error) => kprintln!("exec: {}", error),
                 }
             } else {
-                match crate::fs::read_file(path) {
+                match fs::read_file(path) {
                     Ok(bytes) => match crate::user::exec_elf(&bytes) {
                         Ok(code) => kprintln!("[exec] exited with code {}", code),
                         Err(error) => kprintln!("exec: {}", error),
