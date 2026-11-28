@@ -1,14 +1,27 @@
-use crate::fs::FileMeta;
 use crate::pipe::{self, PipeEnd};
 
 pub const MAX_FDS: usize = 16;
+pub const O_RDONLY: u32 = 0;
+pub const O_WRONLY: u32 = 1;
+pub const O_RDWR: u32 = 2;
+pub const O_CREAT: u32 = 0x40;
+pub const O_TRUNC: u32 = 0x200;
+pub const O_APPEND: u32 = 0x400;
 pub(crate) const EBADF: i64 = -9;
+pub(crate) const FILE_NAME_SIZE: usize = 48;
 const FIRST_DYNAMIC_FD: usize = 3;
 
 pub enum FdKind {
     ConsoleIn,
     ConsoleOut,
-    AegisFile { meta: FileMeta, offset: usize },
+    AegisFile {
+        name: [u8; FILE_NAME_SIZE],
+        name_len: usize,
+        readable: bool,
+        writable: bool,
+        append: bool,
+        offset: usize,
+    },
     PipeRead(PipeEnd),
     PipeWrite(PipeEnd),
 }
@@ -41,10 +54,6 @@ impl FdTable {
             .filter(|entry| entry.is_none())
             .count()
             >= count
-    }
-
-    pub fn get(&self, fd: usize) -> Option<&FdKind> {
-        self.entries.get(fd)?.as_ref()
     }
 
     pub fn get_mut(&mut self, fd: usize) -> Option<&mut FdKind> {
