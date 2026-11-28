@@ -1,6 +1,7 @@
 use core::mem::size_of;
 use core::ptr::read_volatile;
 
+use crate::platform::{phys_to_virt, virt_to_phys};
 use crate::sync::IrqSpinLock;
 use crate::virtio::{self, VIRTQ_DESC_F_WRITE, VirtioTransport};
 
@@ -40,7 +41,7 @@ pub fn init() -> bool {
         return false;
     };
 
-    let Ok(transport) = VirtioTransport::init(mmio_base) else {
+    let Ok(transport) = VirtioTransport::init(phys_to_virt(mmio_base)) else {
         return false;
     };
 
@@ -73,7 +74,7 @@ pub fn info() -> Option<(usize, usize, u64)> {
 fn do_request(
     req_type: u32,
     sector: u64,
-    data_addr: u64,
+    data_virt: usize,
     data_flags: u16,
 ) -> Result<(), &'static str> {
     let mut guard = BLK_DEVICE.lock();
@@ -91,16 +92,24 @@ fn do_request(
 
     let descs = [
         (
-            &raw const req as usize as u64,
+            virt_to_phys(&raw const req as usize) as u64,
             size_of::<BlkReqHeader>() as u32,
             0,
         ),
-        (data_addr, SECTOR_SIZE as u32, data_flags),
-        (&raw mut status as usize as u64, 1, VIRTQ_DESC_F_WRITE),
+        (
+            virt_to_phys(data_virt) as u64,
+            SECTOR_SIZE as u32,
+            data_flags,
+        ),
+        (
+            virt_to_phys(&raw mut status as usize) as u64,
+            1,
+            VIRTQ_DESC_F_WRITE,
+        ),
     ];
 
-    // SAFETY: `req`, the 512-byte caller buffer at `data_addr`, and `status` reside in
-    // identity-mapped RAM and remain valid for the duration of the synchronous request.
+    // SAFETY: All three descriptors refer to direct-mapped RAM buffers that remain live
+    // with the requested DMA permissions until this synchronous request completes.
     unsafe {
         dev.transport.submit_chain(descs);
     }
@@ -120,12 +129,12 @@ pub fn read_sector(sector: u64, buf: &mut [u8; 512]) -> Result<(), &'static str>
     do_request(
         VIRTIO_BLK_T_IN,
         sector,
-        buf.as_mut_ptr() as usize as u64,
+        buf.as_mut_ptr() as usize,
         VIRTQ_DESC_F_WRITE,
     )
 }
 
 #[allow(dead_code)]
 pub fn write_sector(sector: u64, buf: &[u8; 512]) -> Result<(), &'static str> {
-    do_request(VIRTIO_BLK_T_OUT, sector, buf.as_ptr() as usize as u64, 0)
+    do_request(VIRTIO_BLK_T_OUT, sector, buf.as_ptr() as usize, 0)
 }
