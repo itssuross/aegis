@@ -2,11 +2,10 @@ use alloc::boxed::Box;
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 
-pub const QUEUE_SIZE: usize = 16;
+use crate::platform::{phys_to_virt, virt_to_phys};
+pub use crate::platform::{VIRTIO_MMIO_BASE, VIRTIO_MMIO_SLOTS, VIRTIO_MMIO_STRIDE};
 
-pub const VIRTIO_MMIO_BASE: usize = 0x0a00_0000;
-pub const VIRTIO_MMIO_STRIDE: usize = 0x200;
-pub const VIRTIO_MMIO_SLOTS: usize = 32;
+pub const QUEUE_SIZE: usize = 16;
 
 const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
 const VIRTIO_VERSION_2: u32 = 2;
@@ -120,20 +119,21 @@ fn dsb_sy() {
 #[inline]
 fn mmio_read32(base: usize, offset: usize) -> u32 {
     let ptr = (base + offset) as *const u32;
-    // SAFETY: `base + offset` lies within the identity-mapped QEMU virt VirtIO MMIO region.
+    // SAFETY: `base + offset` lies within the higher-half QEMU virt VirtIO MMIO region.
     unsafe { read_volatile(ptr) }
 }
 
 #[inline]
 fn mmio_write32(base: usize, offset: usize, value: u32) {
     let ptr = (base + offset) as *mut u32;
-    // SAFETY: `base + offset` lies within the identity-mapped QEMU virt VirtIO MMIO region.
+    // SAFETY: `base + offset` lies within the higher-half QEMU virt VirtIO MMIO region.
     unsafe { write_volatile(ptr, value) }
 }
 
 pub fn find_device(device_id: u32) -> Option<(usize, usize)> {
     for slot in 0..VIRTIO_MMIO_SLOTS {
-        let base = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
+        let phys = VIRTIO_MMIO_BASE + slot * VIRTIO_MMIO_STRIDE;
+        let base = phys_to_virt(phys);
         if mmio_read32(base, REG_MAGIC_VALUE) != VIRTIO_MAGIC {
             continue;
         }
@@ -141,7 +141,7 @@ pub fn find_device(device_id: u32) -> Option<(usize, usize)> {
             continue;
         }
         if mmio_read32(base, REG_DEVICE_ID) == device_id {
-            return Some((slot, base));
+            return Some((slot, phys));
         }
     }
     None
@@ -201,9 +201,9 @@ impl VirtioTransport {
         }
 
         let queue = Box::new(SplitVirtqueue::zeroed());
-        let desc_addr = (&raw const queue.desc) as usize as u64;
-        let avail_addr = (&raw const queue.avail) as usize as u64;
-        let used_addr = (&raw const queue.used) as usize as u64;
+        let desc_addr = virt_to_phys(&raw const queue.desc as usize) as u64;
+        let avail_addr = virt_to_phys(&raw const queue.avail as usize) as u64;
+        let used_addr = virt_to_phys(&raw const queue.used as usize) as u64;
 
         mmio_write32(base, REG_QUEUE_NUM, QUEUE_SIZE as u32);
         mmio_write32(base, REG_QUEUE_DESC_LOW, desc_addr as u32);
@@ -234,8 +234,8 @@ impl VirtioTransport {
         mmio_read32(self.base, offset)
     }
 
-    // SAFETY: Each descriptor `(addr, len, flags)` must point to valid, identity-mapped RAM
-    // that remains live and appropriately readable/writable for DMA until this call returns.
+    // SAFETY: Each descriptor holds a physical RAM address. Its buffer must remain live
+    // and accessible to the device with the specified DMA permissions until this call returns.
     pub unsafe fn submit_chain(&mut self, descs: [(u64, u32, u16); 3]) {
         for (i, (addr, len, flags)) in descs.into_iter().enumerate() {
             let desc = VirtqDesc {
@@ -268,7 +268,7 @@ impl VirtioTransport {
 
         let expected_used = self.last_used_idx.wrapping_add(1);
         loop {
-            // SAFETY: `self.queue.used.idx` is updated by the VirtIO device in identity-mapped RAM.
+            // SAFETY: `self.queue.used.idx` is updated by the VirtIO device until the request completes.
             let used_idx = unsafe { read_volatile(&raw const self.queue.used.idx) };
             if used_idx == expected_used {
                 break;
