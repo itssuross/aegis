@@ -9,6 +9,7 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
 unsafe extern "C" {
+    static __kernel_virt_start: u8;
     static __heap_start: u8;
     static __heap_end: u8;
 }
@@ -67,7 +68,7 @@ fn execute(line: &str) {
         "help" => {
             kprintln!("Available commands:");
             kprintln!("  help            Show this command list");
-            kprintln!("  info            Show kernel version, EL, MIDR_EL1, MMU, and timer freq");
+            kprintln!("  info            Show kernel version, EL, CPU ID, MMU, VMA, and timer freq");
             kprintln!("  cpuinfo         Show per-core timer and scheduler counters");
             kprintln!("  uptime          Show uptime in seconds");
             kprintln!("  mem             Show heap bounds and allocated/free bytes");
@@ -90,10 +91,18 @@ fn execute(line: &str) {
             } else {
                 "disabled"
             };
-            kprintln!("Aegis v0.5.0 (aarch64-unknown-none)");
+            let kernel_vma = &raw const __kernel_virt_start as usize;
+            kprintln!("Aegis v0.6.0 (aarch64-unknown-none)");
             kprintln!("  CurrentEL  : EL{}", read_current_el());
             kprintln!("  MIDR_EL1   : {:#010x}", read_midr_el1());
             kprintln!("  MMU        : {}", mmu_status);
+            kprintln!(
+                "  KernelVMA  : 0x{:04X}_{:04X}_{:04X}_{:04X} (TTBR1_EL1)",
+                kernel_vma >> 48,
+                (kernel_vma >> 32) & 0xffff,
+                (kernel_vma >> 16) & 0xffff,
+                kernel_vma & 0xffff
+            );
             kprintln!("  CNTFRQ_EL0 : {} Hz", crate::timer::frequency_hz());
         }
         "cpuinfo" => {
