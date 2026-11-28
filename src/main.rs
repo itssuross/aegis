@@ -59,6 +59,7 @@ core::arch::global_asm!(include_str!("exceptions.S"));
 core::arch::global_asm!(include_str!("context.S"));
 
 unsafe extern "C" {
+    static __kernel_virt_start: u8;
     static __heap_start: u8;
     static __heap_end: u8;
 }
@@ -150,22 +151,25 @@ pub extern "C" fn kmain() -> ! {
     gic::init();
     scheduler::init();
     smp::boot_secondary_cores();
-    kprintln!(
-        "[smp] active cores: {}/{}",
-        smp::online_cpus(),
-        smp::MAX_CPUS
-    );
+    let online_cpus = smp::online_cpus();
+    if online_cpus == smp::MAX_CPUS {
+        // SAFETY: Core 0's PC, stack, and vectors are mapped by TTBR1, and all secondaries are online.
+        unsafe {
+            mmu::drop_boot_identity_map();
+        }
+    }
+    kprintln!("[smp] active cores: {}/{}", online_cpus, smp::MAX_CPUS);
 
     // SAFETY: The EL1 breakpoint handler advances `ELR_EL1` past `brk #0`.
     unsafe {
         core::arch::asm!("brk #0");
     }
 
-    let mmu_enabled = mmu::is_enabled();
-    assert!(mmu_enabled, "MMU failed to enable");
+    let kernel_start = &raw const __kernel_virt_start as usize;
     kprintln!(
-        "[mmu] enabled={} (4KB granule, 39-bit VA, identity map, I/D caches on)",
-        mmu_enabled
+        "[mmu] enabled={} (4KB granule, 39-bit VA, TTBR1 kernel at {:#x}, I/D caches on)",
+        mmu::is_enabled(),
+        kernel_start
     );
 
     let (base_allocated, base_free) = allocator::stats();
@@ -237,8 +241,7 @@ pub extern "C" fn kmain() -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn secondary_main(cpu_id: usize) -> ! {
-    // SAFETY: Core 0 finished `mmu::init()` before issuing PSCI CPU_ON, and this core is at EL1
-    // with the MMU disabled.
+    // SAFETY: The trampoline installed this core's higher-half stack and vectors before branching here.
     unsafe {
         mmu::init_secondary();
     }
