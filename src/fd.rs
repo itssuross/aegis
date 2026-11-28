@@ -1,5 +1,4 @@
-use alloc::vec::Vec;
-
+use crate::fs::FileMeta;
 use crate::pipe::{self, PipeEnd};
 
 pub const MAX_FDS: usize = 16;
@@ -9,7 +8,7 @@ const FIRST_DYNAMIC_FD: usize = 3;
 pub enum FdKind {
     ConsoleIn,
     ConsoleOut,
-    UstarFile { bytes: Vec<u8>, offset: usize },
+    AegisFile { meta: FileMeta, offset: usize },
     PipeRead(PipeEnd),
     PipeWrite(PipeEnd),
 }
