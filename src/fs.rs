@@ -161,6 +161,71 @@ impl Filesystem {
         self.revisions[entry_idx] = self.revisions[entry_idx].wrapping_add(1);
         Ok(())
     }
+
+    fn update_file(&mut self, name: &str, data: &[u8], append: bool) -> Result<(), &'static str> {
+        let entry_idx = self
+            .index(name)
+            .or_else(|| self.entries.iter().position(Option::is_none))
+            .ok_or("fs: directory full")?;
+        let mut entry = match self.entries[entry_idx] {
+            Some(_) if append && data.is_empty() => return Ok(()),
+            Some(entry) => entry,
+            None => {
+                let mut entry = DirEntry {
+                    name: [0; NAME_SIZE],
+                    start_sector: 0,
+                    size: 0,
+                    capacity_sectors: 0,
+                };
+                entry.name[..name.len()].copy_from_slice(name.as_bytes());
+                entry
+            }
+        };
+        if !append {
+            entry.size = 0;
+        }
+        self.write_entry(entry_idx, entry, entry.size as usize, data)?;
+        Ok(())
+    }
+
+    fn write_entry(
+        &mut self,
+        entry_idx: usize,
+        mut entry: DirEntry,
+        offset: usize,
+        data: &[u8],
+    ) -> Result<usize, &'static str> {
+        let end = offset.checked_add(data.len()).ok_or("fs: file too large")?;
+        let old_size = entry.size as usize;
+        let size = old_size.max(end);
+        if size > (TOTAL_SECTORS - DATA_START) * SECTOR_SIZE {
+            return Err("fs: file too large");
+        }
+        let needed = size.div_ceil(ALLOCATION_SECTORS * SECTOR_SIZE).max(1) * ALLOCATION_SECTORS;
+        if needed > entry.capacity_sectors as usize {
+            let start = self.allocate(needed)?;
+            let mut block = [0; SECTOR_SIZE];
+            for index in 0..old_size.div_ceil(SECTOR_SIZE) {
+                blk::read_sector(u64::from(entry.start_sector) + index as u64, &mut block)?;
+                blk::write_sector(start + index, &block)?;
+            }
+            entry.start_sector = start as u32;
+            entry.capacity_sectors = needed as u32;
+        }
+
+        let start = entry.start_sector as usize;
+        let zeros = [0; SECTOR_SIZE];
+        let mut gap = old_size;
+        while gap < offset {
+            let count = (offset - gap).min(SECTOR_SIZE - gap % SECTOR_SIZE);
+            write_extent(start, gap, &zeros[..count])?;
+            gap += count;
+        }
+        write_extent(start, offset, data)?;
+        entry.size = size as u32;
+        self.store_entry(entry_idx, Some(entry))?;
+        Ok(end)
+    }
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> u32 {
@@ -251,6 +316,13 @@ pub fn read_at(meta: &FileMeta, offset: usize, dst: &mut [u8]) -> Result<usize, 
     read_extent(&current, offset, dst)
 }
 
+pub fn read_named_at(name: &str, offset: usize, dst: &mut [u8]) -> Result<usize, &'static str> {
+    let mounted = FS.lock();
+    let fs = mounted.as_ref().ok_or("fs: AegisFS not mounted")?;
+    let index = fs.index(name).ok_or("fs: file not found")?;
+    read_extent(&fs.meta(index).unwrap(), offset, dst)
+}
+
 pub fn read_file(name: &str) -> Result<Vec<u8>, &'static str> {
     let mounted = FS.lock();
     let fs = mounted.as_ref().ok_or("fs: AegisFS not mounted")?;
@@ -272,11 +344,10 @@ fn write_extent(start: usize, mut offset: usize, mut data: &[u8]) -> Result<(), 
         let sector = start + offset / SECTOR_SIZE;
         let within = offset % SECTOR_SIZE;
         let chunk = data.len().min(SECTOR_SIZE - within);
-        if within != 0 {
+        if chunk != SECTOR_SIZE {
             blk::read_sector(sector as u64, &mut block)?;
         }
         block[within..within + chunk].copy_from_slice(&data[..chunk]);
-        block[within + chunk..].fill(0);
         blk::write_sector(sector, &block)?;
         offset += chunk;
         data = &data[chunk..];
@@ -288,49 +359,7 @@ fn update_file(name: &str, data: &[u8], append: bool) -> Result<(), &'static str
     validate_name(name)?;
     let mut mounted = FS.lock();
     let fs = mounted.as_mut().ok_or("fs: AegisFS not mounted")?;
-    let entry_idx = fs
-        .index(name)
-        .or_else(|| fs.entries.iter().position(Option::is_none))
-        .ok_or("fs: directory full")?;
-    let previous = fs.meta(entry_idx);
-    if append && data.is_empty() && previous.is_some() {
-        return Ok(());
-    }
-
-    let offset = if append {
-        previous.map_or(0, |meta| meta.size)
-    } else {
-        0
-    };
-    let size = offset.checked_add(data.len()).ok_or("fs: file too large")?;
-    if size > (TOTAL_SECTORS - DATA_START) * SECTOR_SIZE {
-        return Err("fs: file too large");
-    }
-    let needed = size.div_ceil(ALLOCATION_SECTORS * SECTOR_SIZE).max(1) * ALLOCATION_SECTORS;
-    let (start, capacity) = match previous {
-        Some(meta) if meta.capacity_sectors >= needed => (meta.start_sector, meta.capacity_sectors),
-        _ => {
-            let start = fs.allocate(needed)?;
-            if let Some(meta) = previous.filter(|_| offset != 0) {
-                let mut block = [0; SECTOR_SIZE];
-                for index in 0..offset.div_ceil(SECTOR_SIZE) {
-                    blk::read_sector((meta.start_sector + index) as u64, &mut block)?;
-                    blk::write_sector(start + index, &block)?;
-                }
-            }
-            (start, needed)
-        }
-    };
-
-    write_extent(start, offset, data)?;
-    let mut entry = DirEntry {
-        name: [0; NAME_SIZE],
-        start_sector: start as u32,
-        size: size as u32,
-        capacity_sectors: capacity as u32,
-    };
-    entry.name[..name.len()].copy_from_slice(name.as_bytes());
-    fs.store_entry(entry_idx, Some(entry))
+    fs.update_file(name, data, append)
 }
 
 pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
@@ -339,6 +368,38 @@ pub fn write_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
 
 pub fn append_file(name: &str, data: &[u8]) -> Result<(), &'static str> {
     update_file(name, data, true)
+}
+
+pub fn open_file(name: &str, create: bool, truncate: bool) -> Result<(), &'static str> {
+    validate_name(name)?;
+    let mut mounted = FS.lock();
+    let fs = mounted.as_mut().ok_or("fs: AegisFS not mounted")?;
+    match fs.index(name) {
+        Some(_) if !truncate => Ok(()),
+        None if !create => Err("fs: file not found"),
+        _ => fs.update_file(name, &[], false),
+    }
+}
+
+fn write_existing(name: &str, offset: Option<usize>, data: &[u8]) -> Result<usize, &'static str> {
+    let mut mounted = FS.lock();
+    let fs = mounted.as_mut().ok_or("fs: AegisFS not mounted")?;
+    let index = fs.index(name).ok_or("fs: file not found")?;
+    let entry = fs.entries[index].unwrap();
+    let offset = offset.unwrap_or(entry.size as usize);
+    if data.is_empty() {
+        return Ok(offset);
+    }
+    fs.write_entry(index, entry, offset, data)
+}
+
+pub fn write_at(name: &str, offset: usize, data: &[u8]) -> Result<usize, &'static str> {
+    write_existing(name, Some(offset), data)?;
+    Ok(data.len())
+}
+
+pub fn append_at_end(name: &str, data: &[u8]) -> Result<usize, &'static str> {
+    write_existing(name, None, data)
 }
 
 pub fn remove_file(name: &str) -> Result<(), &'static str> {
