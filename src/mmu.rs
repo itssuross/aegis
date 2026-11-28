@@ -6,12 +6,6 @@ const ENTRIES_PER_TABLE: usize = 512;
 const TABLE_INDEX_MASK: usize = ENTRIES_PER_TABLE - 1;
 const VA_SPACE_SIZE: usize = 1 << 39; // 39-bit VA (T0SZ = 25)
 const L1_BLOCK_SIZE: u64 = 1 << 30;
-const L2_BLOCK_SIZE: usize = 1 << 21;
-
-const KERNEL_MMIO_START: usize = 0x0800_0000;
-const KERNEL_MMIO_END: usize = 0x0B00_0000;
-const KERNEL_RAM_START: usize = crate::platform::RAM_BASE;
-const KERNEL_RAM_END: usize = crate::platform::RAM_END;
 
 const DESC_TYPE_MASK: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
@@ -22,7 +16,6 @@ const ATTR_INDX_NORMAL: u64 = 0 << 2;
 const ATTR_INDX_DEVICE: u64 = 1 << 2;
 const AP_EL1_RW: u64 = 0b00 << 6;
 const AP_EL0_RW: u64 = 0b01 << 6;
-const AP_EL1_RO: u64 = 0b10 << 6;
 const AP_EL0_RO: u64 = 0b11 << 6;
 const SH_NON: u64 = 0b00 << 8;
 const SH_INNER: u64 = 0b11 << 8;
@@ -81,27 +74,15 @@ static EMPTY_TTBR0_L1: RawPageTable = RawPageTable {
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum PageFlags {
-    KernelRo,
-    KernelRw,
-    KernelRx,
     UserRo,
     UserRw,
     UserRx,
-    Device,
 }
 
 impl PageFlags {
     const fn bits(self) -> u64 {
         match self {
-            Self::KernelRo => {
-                DESC_PAGE | ATTR_INDX_NORMAL | AP_EL1_RO | SH_INNER | AF | PXN | UXN
-            }
-            Self::KernelRw => {
-                DESC_PAGE | ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | PXN | UXN
-            }
-            Self::KernelRx => DESC_PAGE | ATTR_INDX_NORMAL | AP_EL1_RO | SH_INNER | AF | UXN,
             Self::UserRo => {
                 DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RO | SH_INNER | AF | NG | PXN | UXN
             }
@@ -109,7 +90,6 @@ impl PageFlags {
                 DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RW | SH_INNER | AF | NG | PXN | UXN
             }
             Self::UserRx => DESC_PAGE | ATTR_INDX_NORMAL | AP_EL0_RO | SH_INNER | AF | NG | PXN,
-            Self::Device => DESC_PAGE | ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN,
         }
     }
 }
@@ -169,45 +149,6 @@ impl PageTable {
             DESC_TABLE => Ok((entry & ADDR_MASK) as usize),
             _ => Err("mmu: conflicting block descriptor"),
         }
-    }
-
-    fn map_l2_blocks(
-        &mut self,
-        start: usize,
-        end: usize,
-        attrs: u64,
-    ) -> Result<(), &'static str> {
-        let mut addr = start;
-        while addr < end {
-            let (l1_idx, l2_idx, _) = table_indices(addr);
-            // SAFETY: `&mut self` grants exclusive access to `root_phys` and its L2 tables.
-            let l2_phys = unsafe { Self::ensure_next_table(self.root_phys, l1_idx)? };
-            // SAFETY: `l2_phys` is an owned L2 table frame and `l2_idx < ENTRIES_PER_TABLE`.
-            let existing = unsafe { read_entry(l2_phys, l2_idx) };
-            if (existing & DESC_TYPE_MASK) != 0 {
-                return Err("mmu: L2 entry already mapped");
-            }
-            // SAFETY: `l2_phys` is owned exclusively by `&mut self` and `l2_idx < ENTRIES_PER_TABLE`.
-            unsafe {
-                write_entry(l2_phys, l2_idx, (addr as u64) | DESC_BLOCK | attrs);
-            }
-            addr += L2_BLOCK_SIZE;
-        }
-        Ok(())
-    }
-
-    pub fn map_kernel_regions(&mut self) -> Result<(), &'static str> {
-        self.map_l2_blocks(
-            KERNEL_MMIO_START,
-            KERNEL_MMIO_END,
-            ATTR_INDX_DEVICE | AP_EL1_RW | SH_NON | AF | PXN | UXN,
-        )?;
-        self.map_l2_blocks(
-            KERNEL_RAM_START,
-            KERNEL_RAM_END,
-            ATTR_INDX_NORMAL | AP_EL1_RW | SH_INNER | AF | UXN,
-        )?;
-        Ok(())
     }
 
     pub fn map_4k(
