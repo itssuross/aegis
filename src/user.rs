@@ -2,7 +2,9 @@ use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
-use crate::fd::{EBADF, FdKind, FdTable};
+use crate::fd::{
+    EBADF, FILE_NAME_SIZE, FdKind, FdTable, O_APPEND, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY,
+};
 use crate::mmu::{PageFlags, PageTable};
 use crate::pipe::{self, PipeHandle};
 use crate::platform::{PAGE_SIZE, phys_to_virt};
@@ -34,8 +36,10 @@ const ENOEXEC: i64 = -8;
 const ECHILD: i64 = -10;
 const EAGAIN: i64 = -11;
 const ENOMEM: i64 = -12;
+const EINVAL: i64 = -22;
 const ENFILE: i64 = -23;
 const EMFILE: i64 = -24;
+const ENOSPC: i64 = -28;
 
 const _: () = assert!(USER_STACK_GUARD + PAGE_SIZE == USER_STACK_BASE);
 const _: () = assert!(USER_STACK_BASE + PAGE_SIZE == USER_STACK_TOP);
@@ -765,8 +769,15 @@ pub fn sys_read(fd: usize, buf: &mut [u8]) -> i64 {
             }
             Ok(count)
         }
-        Some(FdKind::AegisFile { meta, offset }) => {
-            let count = crate::fs::read_at(meta, *offset, buf).map_err(file_errno)?;
+        Some(FdKind::AegisFile {
+            name,
+            name_len,
+            readable: true,
+            offset,
+            ..
+        }) => {
+            let path = core::str::from_utf8(&name[..*name_len]).expect("validated file name");
+            let count = crate::fs::read_named_at(path, *offset, buf).map_err(file_errno)?;
             *offset += count;
             Ok(count)
         }
@@ -777,12 +788,33 @@ pub fn sys_read(fd: usize, buf: &mut [u8]) -> i64 {
 }
 
 pub fn sys_write(fd: usize, buf: &[u8]) -> i64 {
-    with_current_fds(|fds| match fds.get(fd) {
+    with_current_fds(|fds| match fds.get_mut(fd) {
         Some(FdKind::ConsoleOut) => {
             for &byte in buf {
                 crate::uart::write_byte(byte);
             }
             Ok(buf.len())
+        }
+        Some(FdKind::AegisFile {
+            name,
+            name_len,
+            writable: true,
+            append,
+            offset,
+            ..
+        }) => {
+            let path = core::str::from_utf8(&name[..*name_len]).expect("validated file name");
+            if *append {
+                let end = crate::fs::append_at_end(path, buf).map_err(file_errno)?;
+                if !buf.is_empty() {
+                    *offset = end;
+                }
+                Ok(buf.len())
+            } else {
+                let count = crate::fs::write_at(path, *offset, buf).map_err(file_errno)?;
+                *offset += count;
+                Ok(count)
+            }
         }
         Some(FdKind::PipeWrite(end)) => pipe::write(end, buf),
         _ => Err(EBADF),
@@ -794,21 +826,59 @@ fn file_errno(error: &str) -> i64 {
     match error {
         "fs: file not found" => ENOENT,
         "fs: file too large for available memory" => ENOMEM,
+        "fs: invalid filename" => EINVAL,
+        "fs: directory full" | "fs: no contiguous space" | "fs: file too large" => ENOSPC,
         _ => EIO,
     }
 }
 
-pub fn sys_open(path: &str) -> i64 {
+pub fn sys_open(path: &str, flags: u32) -> i64 {
+    const ACCESS_MODE: u32 = O_WRONLY | O_RDWR;
+    if flags & !(ACCESS_MODE | O_CREAT | O_TRUNC | O_APPEND) != 0 {
+        return EINVAL;
+    }
+    let (readable, writable) = match flags & ACCESS_MODE {
+        O_RDONLY => (true, false),
+        O_WRONLY => (false, true),
+        O_RDWR => (true, true),
+        _ => return EINVAL,
+    };
+    let create = flags & O_CREAT != 0;
+    let truncate = flags & O_TRUNC != 0;
+    if truncate && !writable {
+        return EINVAL;
+    }
+
     with_current_fds(|fds| {
         if !fds.has_capacity(1) {
             return Err(EMFILE);
         }
         let path = path.strip_prefix("./").unwrap_or(path);
-        let meta = crate::fs::find(path).ok_or(ENOENT)?;
-        fds.alloc(FdKind::AegisFile { meta, offset: 0 })
-            .ok_or(EMFILE)
+        if !create && !truncate {
+            crate::fs::find(path).ok_or(ENOENT)?;
+        } else if create && truncate {
+            crate::fs::write_file(path, &[]).map_err(file_errno)?;
+        } else {
+            crate::fs::open_file(path, create, truncate).map_err(file_errno)?;
+        }
+        let mut name = [0; FILE_NAME_SIZE];
+        name[..path.len()].copy_from_slice(path.as_bytes());
+        fds.alloc(FdKind::AegisFile {
+            name,
+            name_len: path.len(),
+            readable,
+            writable,
+            append: flags & O_APPEND != 0,
+            offset: 0,
+        })
+        .ok_or(EMFILE)
     })
     .map_or_else(|errno| errno, |fd| fd as i64)
+}
+
+pub fn sys_unlink(path: &str) -> i64 {
+    let path = path.strip_prefix("./").unwrap_or(path);
+    crate::fs::remove_file(path).map_or_else(file_errno, |()| 0)
 }
 
 pub fn sys_close(fd: usize) -> i64 {
