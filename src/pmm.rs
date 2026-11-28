@@ -1,6 +1,6 @@
 use core::ptr;
 
-use crate::platform::{PAGE_SHIFT, PAGE_SIZE, RAM_END, RAM_SIZE};
+use crate::platform::{PAGE_SHIFT, PAGE_SIZE, RAM_END, RAM_SIZE, phys_to_virt, virt_to_phys};
 use crate::sync::IrqSpinLock;
 
 const MAX_FRAMES: usize = 32_768;
@@ -27,7 +27,7 @@ struct PmmState {
     managed_end: usize,
     total_frames: usize,
     used_frames: usize,
-    bitmap: [u64; BITMAP_WORDS], // bit 1 = used/reserved, bit 0 = free
+    bitmap: [u64; BITMAP_WORDS],
 }
 
 static PMM: IrqSpinLock<PmmState> = IrqSpinLock::new(PmmState::new());
@@ -65,7 +65,7 @@ impl PmmState {
 }
 
 pub fn init() {
-    let heap_end = &raw const __heap_end as usize;
+    let heap_end = virt_to_phys(&raw const __heap_end as usize);
     let start = align_up(heap_end, PAGE_SIZE);
     let end = RAM_END & !(PAGE_SIZE - 1);
 
@@ -115,9 +115,9 @@ pub fn alloc_frame() -> Option<usize> {
         allocated
     }?;
 
-    // SAFETY: `phys` is a 4 KiB-aligned frame in identity-mapped RAM exclusively owned by the caller.
+    // SAFETY: The frame is aligned, direct-mapped, and exclusively reserved in the bitmap.
     unsafe {
-        ptr::write_bytes(phys as *mut u8, 0, PAGE_SIZE);
+        ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, PAGE_SIZE);
     }
     Some(phys)
 }
@@ -170,10 +170,9 @@ pub fn alloc_contiguous(count: usize) -> Option<usize> {
         state.managed_start + (start << PAGE_SHIFT)
     };
 
-    // SAFETY: `phys..phys + count * PAGE_SIZE` is a contiguous run of identity-mapped RAM frames
-    // exclusively owned by the caller after being marked used in the bitmap.
+    // SAFETY: All `count` contiguous frames are direct-mapped and exclusively reserved in the bitmap.
     unsafe {
-        ptr::write_bytes(phys as *mut u8, 0, count * PAGE_SIZE);
+        ptr::write_bytes(phys_to_virt(phys) as *mut u8, 0, count * PAGE_SIZE);
     }
     Some(phys)
 }
