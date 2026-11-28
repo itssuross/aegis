@@ -105,6 +105,17 @@ boot_two() {
         "help" \
         "echo hello from el0 shell" \
         "cat motd.txt" \
+        "touch el0note.txt" \
+        "fsinfo" \
+        "append el0note.txt contents-that-touch-must-preserve" \
+        "touch el0note.txt" \
+        "cat el0note.txt" \
+        "write el0note.txt hello-from-el0" \
+        "append el0note.txt -userspace" \
+        "cat el0note.txt" \
+        "rm el0note.txt" \
+        "cat el0note.txt" \
+        "rm el0note.txt" \
         "uptime" \
         "run hello.elf" \
         "pipetest" \
@@ -189,7 +200,7 @@ if ! awk '
 fi
 
 assert_contains "active cores: 4/4"
-assert_contains "Aegis v0.6.0 (aarch64-unknown-none)"
+assert_line "Aegis v0.7.0 (aarch64-unknown-none)"
 assert_contains "KernelVMA  : 0xFFFF_FF80_4008_0000 (TTBR1_EL1)"
 assert_contains "[pmm]"
 assert_contains "0 frames leaked"
@@ -222,11 +233,20 @@ assert_shell_line() {
 }
 
 assert_shell_line "Aegis EL0 shell (sh.elf) — type 'help'"
-for command in "help" "echo <text>" "cat <file>" "uptime" "run <file>" "pipetest" "exit [code]"; do
+for command in "help" "echo <text>" "fsinfo" "cat <file>" "touch <file>" \
+    "write <file> <text>" "append <file> <text>" "rm <file>" \
+    "uptime" "run <file>" "pipetest" "exit [code]"; do
     assert_shell_line "$command"
 done
 assert_shell_line "hello from el0 shell"
 assert_shell_line "Welcome to Aegis!"
+if ! printf '%s\n' "$shell_output" | grep -Eq '^AegisFS: 512 sectors \([0-9]+ used, [0-9]+ free\), 5/32 files$'; then
+    fail "expected EL0 fsinfo to count the file created by touch"
+fi
+assert_shell_line "contents-that-touch-must-preserve"
+assert_shell_line "hello-from-el0-userspace"
+assert_shell_line "cat: cannot open el0note.txt (-2)"
+assert_shell_line "rm: cannot remove el0note.txt (-2)"
 if ! printf '%s\n' "$shell_output" | grep -Eq '^uptime: [0-9]+ ms$'; then
     echo "FAIL: expected uptime in milliseconds from the EL0 shell" >&2
     cat "$log" >&2
