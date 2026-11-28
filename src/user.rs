@@ -481,8 +481,7 @@ fn load_elf_image(image: &[u8]) -> Result<(UserAddressSpace, usize), &'static st
         return Err("elf: entry point not in executable segment");
     }
 
-    let mut pt = PageTable::new().ok_or("elf: out of physical memory")?;
-    pt.map_kernel_regions()?;
+    let pt = PageTable::new().ok_or("elf: out of physical memory")?;
     let mut addr_space = UserAddressSpace {
         asid: 0,
         pt: Some(pt),
