@@ -76,11 +76,9 @@ fn user_ptr_writable(ptr: usize, len: usize) -> bool {
 }
 
 fn user_ptr_accessible<const WRITE: bool>(ptr: usize, len: usize) -> bool {
-    const USER_VA_LIMIT: usize = crate::platform::GICD_BASE;
-    let Some(end) = ptr.checked_add(len) else {
-        return false;
-    };
-    if ptr >= USER_VA_LIMIT || end > USER_VA_LIMIT {
+    const USER_VA_LIMIT: usize = 0x0000_0080_0000_0000;
+    let end = ptr.saturating_add(len);
+    if ptr >= USER_VA_LIMIT || end >= USER_VA_LIMIT {
         return false;
     }
     if len == 0 {
