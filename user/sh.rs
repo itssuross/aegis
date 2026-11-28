@@ -14,6 +14,14 @@ const SYS_PIPE: u64 = 202;
 const SYS_SPAWN: u64 = 203;
 const SYS_WAITPID: u64 = 204;
 const SYS_UPTIME_MS: u64 = 205;
+const SYS_UNLINK: u64 = 206;
+const SYS_FSINFO: u64 = 207;
+
+const O_RDONLY: usize = 0;
+const O_WRONLY: usize = 1;
+const O_CREAT: usize = 0x40;
+const O_TRUNC: usize = 0x200;
+const O_APPEND: usize = 0x400;
 
 const STDIN: usize = 0;
 const STDOUT: usize = 1;
@@ -46,9 +54,19 @@ fn sys_write(fd: usize, buf: &[u8]) -> i64 {
     unsafe { syscall(SYS_WRITE, fd, buf.as_ptr() as usize, buf.len()) }
 }
 
-fn sys_open(path: &str) -> i64 {
+fn sys_open(path: &str, flags: usize) -> i64 {
     // SAFETY: The path points to readable UTF-8 bytes for the duration of the syscall.
-    unsafe { syscall(SYS_OPEN, path.as_ptr() as usize, path.len(), 0) }
+    unsafe { syscall(SYS_OPEN, path.as_ptr() as usize, path.len(), flags) }
+}
+
+fn sys_unlink(path: &str) -> i64 {
+    // SAFETY: The path points to readable UTF-8 bytes for the duration of the syscall.
+    unsafe { syscall(SYS_UNLINK, path.as_ptr() as usize, path.len(), 0) }
+}
+
+fn sys_fsinfo(stats: &mut [u32; 5]) -> i64 {
+    // SAFETY: The syscall writes five u32 counters into this writable array.
+    unsafe { syscall(SYS_FSINFO, stats.as_mut_ptr() as usize, 0, 0) }
 }
 
 fn sys_close(fd: usize) -> i64 {
@@ -117,13 +135,14 @@ fn cat(path: &str) {
         return;
     }
 
-    let fd = sys_open(path);
+    let fd = sys_open(path, O_RDONLY);
     if fd < 0 {
         let _ = writeln!(Stdout, "cat: cannot open {path} ({fd})");
         return;
     }
     let fd = fd as usize;
     let mut buf = [0; 256];
+    let mut last = None;
     loop {
         let count = sys_read(fd, &mut buf);
         if count == 0 {
@@ -133,8 +152,40 @@ fn cat(path: &str) {
             print("cat: I/O failed\n");
             break;
         }
+        last = Some(buf[count as usize - 1]);
     }
     let _ = sys_close(fd);
+    if last.is_some_and(|byte| byte != b'\n') {
+        print("\n");
+    }
+}
+
+fn fsinfo() {
+    let mut stats = [0; 5];
+    let result = sys_fsinfo(&mut stats);
+    let [total, used, free, active, max] = stats;
+    if result < 0 || total == 0 {
+        print("fsinfo: AegisFS not mounted\n");
+        return;
+    }
+    let _ = writeln!(
+        Stdout,
+        "AegisFS: {total} sectors ({used} used, {free} free), {active}/{max} files"
+    );
+}
+
+fn write_file(command: &str, path: &str, flags: usize, text: &str) {
+    let fd = sys_open(path, O_WRONLY | O_CREAT | flags);
+    if fd < 0 {
+        let _ = writeln!(Stdout, "{command}: cannot open {path} ({fd})");
+        return;
+    }
+    let fd = fd as usize;
+    let wrote = write_all(fd, text.as_bytes());
+    let closed = sys_close(fd);
+    if wrote.is_err() || closed < 0 {
+        let _ = writeln!(Stdout, "{command}: I/O failed");
+    }
 }
 
 fn run(path: &str) {
@@ -198,14 +249,39 @@ fn execute(line: &str) {
 
     match command {
         "" => {}
-        "help" => {
-            print("help\necho <text>\ncat <file>\nuptime\nrun <file>\npipetest\nexit [code]\n")
-        }
+        "help" => print(concat!(
+            "help\necho <text>\nfsinfo\ncat <file>\ntouch <file>\n",
+            "write <file> <text>\nappend <file> <text>\nrm <file>\n",
+            "uptime\nrun <file>\npipetest\nexit [code]\n",
+        )),
         "echo" => {
             print(arg);
             print("\n");
         }
+        "fsinfo" if arg.is_empty() => fsinfo(),
+        "fsinfo" => print("usage: fsinfo\n"),
         "cat" => cat(arg.trim_end()),
+        "touch" | "rm" => {
+            let path = arg.trim_end();
+            if path.is_empty() || path.contains(char::is_whitespace) {
+                let _ = writeln!(Stdout, "usage: {command} <file>");
+            } else if command == "touch" {
+                write_file(command, path, 0, "");
+            } else {
+                let result = sys_unlink(path);
+                if result < 0 {
+                    let _ = writeln!(Stdout, "rm: cannot remove {path} ({result})");
+                }
+            }
+        }
+        "write" | "append" => {
+            if let Some((path, text)) = arg.trim_end().split_once(char::is_whitespace) {
+                let flags = if command == "write" { O_TRUNC } else { O_APPEND };
+                write_file(command, path, flags, text.trim_start());
+            } else {
+                let _ = writeln!(Stdout, "usage: {command} <file> <text>");
+            }
+        }
         "uptime" => {
             let _ = writeln!(Stdout, "uptime: {} ms", sys_uptime_ms());
         }
