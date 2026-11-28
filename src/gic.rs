@@ -1,7 +1,7 @@
 use core::ptr::{read_volatile, write_volatile};
 
-const GICD_BASE: usize = 0x0800_0000;
-const GICC_BASE: usize = 0x0801_0000;
+const GICD_BASE: usize = crate::platform::phys_to_virt(crate::platform::GICD_BASE);
+const GICC_BASE: usize = crate::platform::phys_to_virt(crate::platform::GICC_BASE);
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER0: usize = 0x100;
