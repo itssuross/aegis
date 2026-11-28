@@ -3,7 +3,7 @@ use core::fmt::{self, Write};
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-const UART0_BASE: usize = 0x0900_0000;
+const UART0_BASE: usize = crate::platform::phys_to_virt(crate::platform::UART0_BASE);
 
 const DR: usize = 0x00;
 const FR: usize = 0x18;
