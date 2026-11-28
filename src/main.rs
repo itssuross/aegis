@@ -124,7 +124,7 @@ pub extern "C" fn kmain() -> ! {
     assert_eq!(el, 1, "expected kernel to run at EL1");
     smp::init_cpu_local(0);
 
-    kprintln!("Aegis Kernel v0.5.0 booted on AArch64 (EL{})", el);
+    kprintln!("Aegis Kernel v0.6.0 booted on AArch64 (EL{})", el);
 
     exceptions::init();
     mmu::init();
