@@ -43,20 +43,18 @@ bss_zero_loop:
     b bss_zero_loop
 
 bss_zero_done:
-    bl kmain
-    b .Lpark_core
+    bl boot_enable_higher_half_mmu
+    bl .Lset_higher_half_addresses
+    ldr x1, =kmain
+    br x1
 
 .global secondary_entry
 secondary_entry:
     msr daifset, #0xf // mask D, A, I, F
+    mov x19, x0
 
     mov x1, #(3 << 20) // CPACR_EL1.FPEN
     msr cpacr_el1, x1
-    isb
-
-    adrp x1, exception_vector_table
-    add x1, x1, :lo12:exception_vector_table
-    msr vbar_el1, x1
     isb
 
     sub x1, x0, #1
@@ -67,7 +65,21 @@ secondary_entry:
     add x2, x2, #16384
     mov sp, x2
 
-    bl secondary_main
+    bl boot_enable_higher_half_mmu
+    bl .Lset_higher_half_addresses
+    mov x0, x19
+    ldr x1, =secondary_main
+    br x1
+
+.Lset_higher_half_addresses:
+    mov x2, #0xffffff8000000000 // PHYS_OFFSET
+    add sp, sp, x2
+    adrp x1, exception_vector_table
+    add x1, x1, :lo12:exception_vector_table
+    add x1, x1, x2
+    msr vbar_el1, x1
+    isb
+    ret
 
 .Lpark_core:
     wfe
