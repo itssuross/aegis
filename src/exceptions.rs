@@ -15,6 +15,8 @@ const SYS_PIPE: u64 = 202; // x0 points to two u32 descriptors.
 const SYS_SPAWN: u64 = 203;
 const SYS_WAITPID: u64 = 204;
 const SYS_UPTIME_MS: u64 = 205;
+const SYS_UNLINK: u64 = 206;
+const SYS_FSINFO: u64 = 207; // x0 points to five u32 filesystem counters.
 
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
@@ -182,7 +184,24 @@ fn dispatch_syscall(frame: &El0TrapFrame) -> i64 {
             };
             crate::user::sys_write(x0, buf)
         }
-        SYS_OPEN => with_user_path(x0, x1, crate::user::sys_open),
+        SYS_OPEN => with_user_path(x0, x1, |path| crate::user::sys_open(path, x2 as u32)),
+        SYS_UNLINK => with_user_path(x0, x1, crate::user::sys_unlink),
+        SYS_FSINFO => {
+            if !user_ptr_writable(x0, size_of::<[u32; 5]>()) {
+                return EFAULT;
+            }
+            let stats = crate::fs::stats();
+            let values = [
+                stats.total_sectors as u32,
+                stats.used_sectors as u32,
+                stats.free_sectors as u32,
+                stats.active_files as u32,
+                stats.max_files as u32,
+            ];
+            // SAFETY: The full array fits in validated writable user pages.
+            unsafe { (x0 as *mut [u32; 5]).write_unaligned(values) };
+            0
+        }
         SYS_CLOSE => crate::user::sys_close(x0),
         SYS_PIPE => {
             if !user_ptr_writable(x0, size_of::<[u32; 2]>()) {
