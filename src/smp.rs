@@ -101,8 +101,8 @@ pub fn record_idle_tick() {
 
 fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
     let ret: i64;
-    // SAFETY: Invokes PSCI CPU_ON via QEMU's EL1 HVC conduit with `secondary_entry` as the entry
-    // point after Core 0 has initialized page tables and `secondary_stacks`.
+    // SAFETY: PSCI CPU_ON takes the physical trampoline address after Core 0 has
+    // initialized the boot page tables and secondary stacks.
     unsafe {
         asm!(
             "hvc #0",
@@ -117,7 +117,7 @@ fn psci_cpu_on(target_cpu: u64, entry_point: u64, context_id: u64) -> i64 {
 }
 
 pub fn boot_secondary_cores() {
-    let entry = secondary_entry as *const () as usize as u64;
+    let entry = crate::platform::virt_to_phys(secondary_entry as *const () as usize) as u64;
 
     for cpu in 1..MAX_CPUS {
         let ret = psci_cpu_on(cpu as u64, entry, cpu as u64);
